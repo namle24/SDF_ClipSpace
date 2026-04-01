@@ -1,0 +1,20 @@
+# Model files (Large)
+*.obj
+*.off
+*.txt
+*.npy
+*.exe
+*.bin
+*.pt
+*.pth
+
+# Cache
+__pycache__/
+*.pyc
+
+# IDE
+.idea/
+.vscode/
+
+# Project Log
+*.log
