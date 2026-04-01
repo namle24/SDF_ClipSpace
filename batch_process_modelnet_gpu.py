@@ -8,12 +8,12 @@ import torch
 from tqdm import tqdm
 
 class ModelNetSDFProcessorGPU:
-    def __init__(self, input_dir="ModelNet40", output_dir="ModelNet40_SDF_1024", num_points=1024, num_rays=30, batch_size=1024):
+    def __init__(self, input_dir="ModelNet40", output_dir="ModelNet40_SDF_1024", num_points=1024, num_rays=30, batch_size=256):
         self.input_dir = input_dir
         self.output_dir = output_dir
         self.num_points = num_points
         self.num_rays = num_rays
-        self.batch_size = batch_size # Có thể nới lớn thêm nếu GPU xịn (VRAM > 16GB)
+        self.batch_size = batch_size # Max 256 để chống tràn VRAM khi Face > 100k
         
         # Chọn Device ưu tiên GPU
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -61,6 +61,7 @@ class ModelNetSDFProcessorGPU:
         bounds = torch.tensor(mesh.bounds, dtype=torch.float32, device=self.device)
         bbox_diag = torch.norm(bounds[1] - bounds[0])
         radius = 0.01 * bbox_diag
+        ray_epsilon = 1e-5 * bbox_diag
         
         face_vertices_world = mesh_vertices_tensor[faces_tensor]
         dist_matrix = torch.full((N, self.num_rays), float('nan'), device=self.device)
@@ -143,33 +144,29 @@ class ModelNetSDFProcessorGPU:
             Area = (v1_x - v0_x)*(v2_y - v0_y) - (v1_y - v0_y)*(v2_x - v0_x)
             Z_hit = (w0 * v0_z + w1 * v1_z + w2 * v2_z) / (Area + 1e-12)
             
-            valid = inside & (Z_hit > 1e-4) & (torch.abs(Area) > 1e-12) & (~is_umbrella)
+            valid = inside & (Z_hit > ray_epsilon) & (torch.abs(Area) > 1e-12) & (~is_umbrella)
             Z_hit = torch.where(valid, Z_hit, torch.tensor(float('inf'), device=self.device))
             
             # Nearest depth selection
             min_Z, _ = torch.min(Z_hit, dim=2)
-            dist_matrix[i:end, :] = torch.where(min_Z == float('inf'), torch.tensor(float('nan'), device=self.device), min_Z)
+            dist_matrix[i:end, :] = torch.where(torch.isinf(min_Z), torch.tensor(float('nan'), device=self.device), min_Z)
             
         # --- 7. Statistical IQR Outlier Removal ---
-        # Chuyển vùng nhỏ 1024x30 trở lại CPU cho Nan-percentile (rất nhẹ, tốn ~0s)
-        dist_matrix_np = dist_matrix.cpu().numpy()
+        # --- 7. Statistical IQR Outlier Removal Pytorch GPU ---
+        q1 = torch.nanquantile(dist_matrix, 0.25, dim=1)
+        q3 = torch.nanquantile(dist_matrix, 0.75, dim=1)
+        iqr = q3 - q1
         
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            
-            q1 = np.nanpercentile(dist_matrix_np, 25, axis=1)
-            q3 = np.nanpercentile(dist_matrix_np, 75, axis=1)
-            iqr = q3 - q1
-            
-            lower_bound = q1 - 1.5 * iqr
-            upper_bound = q3 + 1.5 * iqr
-            
-            valid_mask = (dist_matrix_np >= lower_bound[:, None]) & (dist_matrix_np <= upper_bound[:, None])
-            filtered_dist_matrix = np.where(valid_mask, dist_matrix_np, np.nan)
-            
-            sdf_values = np.nanmean(filtered_dist_matrix, axis=1)
-            sdf_values = np.nan_to_num(sdf_values, nan=0.0)
-            
+        lower_bound = q1 - 1.5 * iqr
+        upper_bound = q3 + 1.5 * iqr
+        
+        valid_mask = (dist_matrix >= lower_bound.unsqueeze(1)) & (dist_matrix <= upper_bound.unsqueeze(1))
+        filtered_dist_matrix = torch.where(valid_mask, dist_matrix, torch.tensor(float('nan'), device=self.device))
+        
+        sdf_tensor = torch.nanmean(filtered_dist_matrix, dim=1)
+        sdf_tensor = torch.nan_to_num(sdf_tensor, nan=0.0)
+        
+        sdf_values = sdf_tensor.cpu().numpy()
         return sdf_values
 
     def process_file(self, file_path):
@@ -249,8 +246,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="ModelNet40_SDF_1024", help="Thư mục xuất file .npy")
     parser.add_argument("--num_points", type=int, default=1024, help="Số điểm lấy mẫu")
     parser.add_argument("--num_rays", type=int, default=30, help="Số lượng tia bắn cho mỗi điểm")
-    # Tăng Default batch_size lên 1024 để chạy thẳng một hơi trên VRAM thay vì phải loop
-    parser.add_argument("--batch_size", type=int, default=1024, help="Kích thước batch Vectorization cho GPU")
+    # Tăng Default batch_size lên 256 để chống tràn VRAM
+    parser.add_argument("--batch_size", type=int, default=256, help="Kích thước batch Vectorization cho GPU")
     
     args = parser.parse_args()
     

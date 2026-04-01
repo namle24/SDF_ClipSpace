@@ -7,7 +7,7 @@ import torch
 from tqdm import tqdm
 
 @torch.no_grad()
-def compute_custom_ortho_sdf_gpu(mesh, num_rays=30, batch_size=1024):
+def compute_custom_ortho_sdf_gpu(mesh, num_rays=30, batch_size=256):
     """
     SDF Calculation bằng PyTorch Tensor GPU Vectorized Orthographic Rasterizer.
     Tối đa hóa hiệu năng bằng VRAM và CUDA Cores. Giữ nguyên toàn bộ bề mặt lưới (Mesh).
@@ -30,7 +30,8 @@ def compute_custom_ortho_sdf_gpu(mesh, num_rays=30, batch_size=1024):
     bounds = torch.tensor(mesh.bounds, dtype=torch.float32, device=device)
     bbox_diag = torch.norm(bounds[1] - bounds[0])
     radius = 0.01 * bbox_diag
-    print(f"[*] BBox Diagonal: {bbox_diag:.4f}, Bán kính chùm tia trực giao: {radius:.4f}")
+    ray_epsilon = 1e-5 * bbox_diag  # Dynamic Epsilon để tránh self-intersection ổn định cho mọi Size Object
+    print(f"[*] BBox Diagonal: {bbox_diag:.4f}, Bán kính chùm tia trực giao: {radius:.4f}, Ray Epsilon: {ray_epsilon:.6f}")
     
     face_vertices_world = mesh_vertices_tensor[faces_tensor]
     dist_matrix = torch.full((N, num_rays), float('nan'), device=device)
@@ -117,35 +118,37 @@ def compute_custom_ortho_sdf_gpu(mesh, num_rays=30, batch_size=1024):
         Area = (v1_x - v0_x)*(v2_y - v0_y) - (v1_y - v0_y)*(v2_x - v0_x)
         Z_hit = (w0 * v0_z + w1 * v1_z + w2 * v2_z) / (Area + 1e-12)
         
-        # Kiểm định tia bắn hợp lệ (Nằm trong mặt, Phóng đi tới r>0, Mặt ko suy biến, Mặt ko phải do mặt chứa đỉnh gốc)
-        valid = inside & (Z_hit > 1e-4) & (torch.abs(Area) > 1e-12) & (~is_umbrella)
+        # Kiểm định tia bắn hợp lệ (Nằm trong mặt, Phóng đi tới khoảng an toàn epsilon, Mặt ko suy biến, Mặt ko phải do mặt chứa đỉnh gốc)
+        valid = inside & (Z_hit > ray_epsilon) & (torch.abs(Area) > 1e-12) & (~is_umbrella)
         Z_hit = torch.where(valid, Z_hit, torch.tensor(float('inf'), device=device))
         
-        # Ray Tracing Tìm khoảng cách sát màng nhất
+        # Ray Tracing Tìm khoảng cách đâm xuyên gần nhất (Nearest hit Z-buffer)
         min_Z, _ = torch.min(Z_hit, dim=2)
-        dist_matrix[i:end, :] = torch.where(min_Z == float('inf'), torch.tensor(float('nan'), device=device), min_Z)
+        dist_matrix[i:end, :] = torch.where(torch.isinf(min_Z), torch.tensor(float('nan'), device=device), min_Z)
         
     print(f"[*] Hoàn thành Tensor Rasterization toàn bộ tia! Thời gian: {time.time() - start_time:.4f}s")
     
-    # 7. Khử Outlier IQR (Dùng Fallback CPU vì NanoPercentile chưa tối ưu trên CUDA ở pytorch)
-    print("[*] Đang áp dụng lọc IQR cho Tứ phân vị mảng nhiễu...")
-    dist_matrix_np = dist_matrix.cpu().numpy()
+    # 7. Khử nhiễu Outlier IQR hoàn toàn bằng GPU PyTorch (100% Vectorized GPU)
+    print("[*] Áp dụng lọc Outlier IQR bằng PyTorch Vectorized GPU...")
     
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        
-        q1 = np.nanpercentile(dist_matrix_np, 25, axis=1)
-        q3 = np.nanpercentile(dist_matrix_np, 75, axis=1)
-        iqr = q3 - q1
-        
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
-        
-        valid_mask = (dist_matrix_np >= lower_bound[:, None]) & (dist_matrix_np <= upper_bound[:, None])
-        filtered_dist_matrix = np.where(valid_mask, dist_matrix_np, np.nan)
-        
-        sdf_values = np.nanmean(filtered_dist_matrix, axis=1)
-        sdf_values = np.nan_to_num(sdf_values, nan=0.0)
+    # Nếu hàng full NaN, torch.nanquantile trả NaN tự động. Filter runtime warning ko cần thiết.
+    q1 = torch.nanquantile(dist_matrix, 0.25, dim=1)
+    q3 = torch.nanquantile(dist_matrix, 0.75, dim=1)
+    iqr = q3 - q1
+    
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+    
+    valid_mask = (dist_matrix >= lower_bound.unsqueeze(1)) & (dist_matrix <= upper_bound.unsqueeze(1))
+    
+    filtered_dist_matrix = torch.where(valid_mask, dist_matrix, torch.tensor(float('nan'), device=device))
+    
+    # Tính mean và fill NaNs
+    sdf_tensor = torch.nanmean(filtered_dist_matrix, dim=1)
+    sdf_tensor = torch.nan_to_num(sdf_tensor, nan=0.0)
+    
+    # Đẩy lên CPU để PyVista có thể dùng làm scalars
+    sdf_values = sdf_tensor.cpu().numpy()
     
     print(f"[*] SDF Trung bình toàn bộ đối tượng: {np.mean(sdf_values):.4f}")
     return sdf_values
@@ -155,7 +158,7 @@ def main():
     parser = argparse.ArgumentParser(description="Custom Orthographic VO-SDF bằng Pytorch GPU để Visualization vùng mượt")
     parser.add_argument("--input_file", type=str, default="bunny.obj", help="Tên file hoặc Đường dẫn model 3D để render SDF lên bề mặt")
     parser.add_argument("--num_rays", type=int, default=30, help="Số tia bắn (chùm nón trực giao)")
-    parser.add_argument("--batch_size", type=int, default=32, help="GPU Batch Size - Không sợ quá tải VRAM!")
+    parser.add_argument("--batch_size", type=int, default=256, help="GPU Batch Size - Khuyến cáo <= 256 để tránh OOM.")
     args = parser.parse_args()
     
     model_path = args.input_file
