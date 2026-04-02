@@ -158,7 +158,7 @@ def main():
     parser = argparse.ArgumentParser(description="Custom Orthographic VO-SDF bằng Pytorch GPU để Visualization vùng mượt")
     parser.add_argument("--input_file", type=str, default="bunny.obj", help="Tên file hoặc Đường dẫn model 3D để render SDF lên bề mặt")
     parser.add_argument("--num_rays", type=int, default=30, help="Số tia bắn (chùm nón trực giao)")
-    parser.add_argument("--batch_size", type=int, default=256, help="GPU Batch Size - Khuyến cáo <= 256 để tránh OOM.")
+    parser.add_argument("--batch_size", type=int, default=128, help="GPU Batch Size - Khuyến cáo <= 256 để tránh OOM.")
     args = parser.parse_args()
     
     model_path = args.input_file
@@ -166,31 +166,36 @@ def main():
         mesh = trimesh.load(model_path, force='mesh')
         if len(mesh.vertices) == 0:
             raise ValueError("Đồ thị (Mesh) trống hoặc hỏng.")
+                    # Ép thuật toán của trimesh tự động sửa lại hướng của pháp tuyến chĩa ra ngoài
+        mesh.fix_normals()
+        # -----------------------------
+        
     except Exception as e:
         print(f"Không thể tải mesh {model_path}. Lỗi: {e}")
         return
 
     # Chạy Hàm SDF GPU
     t1 = time.time()
-    sdf_values = compute_custom_ortho_sdf_gpu(mesh, num_rays=args.num_rays, batch_size=args.batch_size)
+    # Lúc này mesh truyền vào đã có vertex_normals chuẩn!
+    sdf_values = compute_custom_ortho_sdf_gpu(mesh, num_rays=args.num_rays, batch_size=args.batch_size) 
     print(f"--- TỔNG THỜI GIAN GPU: {time.time() - t1:.4f}s ---")
 
     # Hiển thị vùng màu mượt bằng PyVista (Mesh Render)
     pv_mesh = pv.wrap(mesh)
-    pv_mesh.point_data['SDF_Thickness'] = sdf_values
+    pv_mesh.point_data['Custom_Ortho_SDF_GPU'] = sdf_values
 
-    plotter = pv.Plotter(title="SDF Visualization - MeshLab Style")
-    # Sử dụng 'jet_r' (Red-Yellow-Blue reversed) để giống MeshLab: Đỏ là mỏng, Xanh là dày
+    plotter = pv.Plotter(title="GPU-Accelerated Surface VO-SDF - MeshLab Style")
+    # Cấu hình chuẩn cho so sánh MeshLab: 
+    # Tắt smooth_shading (Flat rendering), dùng jet_r
     plotter.add_mesh(
         pv_mesh, 
-        scalars='SDF_Thickness', 
+        scalars='Custom_Ortho_SDF_GPU', 
         cmap='jet_r', 
-        smooth_shading=True,   # Giúp vùng màu trông mượt hơn
-        show_edges=False,      # Tắt lưới để nhìn rõ vùng màu như MeshLab
-        scalar_bar_args={'title': "SDF (Thickness)"}
+        smooth_shading=False,
+        show_edges=False,
+        scalar_bar_args={'title': "Ortho-SDF Thickness (GPU)"}
     )
     plotter.set_background('white')
-    # Thêm hướng nhìn trục tọa độ nhỏ ở góc
     plotter.add_axes()
     plotter.show()
 

@@ -167,22 +167,36 @@ def compute_custom_ortho_sdf(mesh, num_rays=30, batch_size=100):
     return sdf_values
 
 def main():
-    model_path = r"C:\Users\Admin\Downloads\grandPiano_V1_L1.123c7f869173-7960-449a-b773-09c1f8708734\grandPiano_V1_L1.123c7f869173-7960-449a-b773-09c1f8708734\10384_GrandPiano.obj"  # Thay tên model tuỳ ý
+    model_path = "data/teapot.obj"  # Thay tên model tuỳ ý
     try:
         mesh = trimesh.load(model_path, force='mesh')
     except Exception as e:
         print(f"Không thể tải mesh {model_path}. Lỗi: {e}")
         return
 
+    print("\n[BẮT ĐẦU VO-SDF VECTORIZED (CPU NATIVE)]")
+    start_time = time.perf_counter()
     sdf_values = compute_custom_ortho_sdf(mesh, num_rays=30, batch_size=100)
+    end_time = time.perf_counter()
 
+    print(f"\n=======================================================")
+    print(f"[*] THỜI GIAN TÍNH TOÁN VO-SDF (CPU): {end_time - start_time:.4f} giây")
+    print(f"=======================================================\n")
     # Visualization bằng PyVista
     pv_mesh = pv.wrap(mesh)
     pv_mesh.point_data['Custom_Ortho_SDF'] = sdf_values
 
-    plotter = pv.Plotter()
-    plotter.add_mesh(pv_mesh, scalars='Custom_Ortho_SDF', cmap='jet', show_scalar_bar=True)
+    plotter = pv.Plotter(title="VO-SDF CPU Visualization - MeshLab Style")
+    plotter.add_mesh(
+        pv_mesh, 
+        scalars='Custom_Ortho_SDF', 
+        cmap='jet_r', 
+        smooth_shading=False,
+        show_edges=False,
+        scalar_bar_args={'title': "Ortho-SDF (Thickness) - CPU"}
+    )
     plotter.set_background('white')
+    plotter.add_axes()
     plotter.show()
 
 if __name__ == "__main__":

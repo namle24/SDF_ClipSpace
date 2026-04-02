@@ -1,6 +1,7 @@
 import trimesh
 import numpy as np
 import pyvista as pv
+import time
 from tqdm import tqdm
 
 
@@ -83,7 +84,7 @@ def compute_sdf_cone(mesh, num_rays=30, cone_angle=120):
         return np.zeros(len(origins))
 
     print(f"Tổng số tia chuẩn bị bắn: {len(all_ray_origins)} tia. Đang bắn theo đợt (Batching)...")
-    batch_size = 100000
+    batch_size = 256
     all_locations = []
     all_index_ray = []
 
@@ -126,17 +127,25 @@ def compute_sdf_cone(mesh, num_rays=30, cone_angle=120):
 
 def main():
     # PATH ĐẾN MODEL CỦA BẠN
-    model_path = r"C:\Users\Admin\Downloads\archive\ModelNet40\car\train\car_0194.off"
+    model_path = "data/teapot.obj"
     try:
         mesh = trimesh.load(model_path, force='mesh')
         # Tự động sửa lỗi mesh (gộp đỉnh, xóa mặt lỗi, xóa mặt trùng...)
+        mesh.fix_normals()
         mesh.process()
     except Exception as e:
         print(f"Lỗi load mesh: {e}")
         return
 
-    # Chạy thuật toán chùm tia (giống hệt config của MeshLab)
+    # Chạy thuật toán chùm tia SDF (Shape Diameter Function chuẩn MeshLab)
+    print("\n[BẮT ĐẦU SÚNG BẮN TIA - SHAPE DIAMETER FUNCTION (SDF)]")
+    start_time = time.perf_counter()
     sdf_values = compute_sdf_cone(mesh, num_rays=30, cone_angle=120)
+    end_time = time.perf_counter()
+
+    print(f"\n=======================================================")
+    print(f"[*] THỜI GIAN TÍNH TOÁN SDF (CPU NATIVE): {end_time - start_time:.4f} giây")
+    print(f"=======================================================\n")
 
     # Hiển thị vùng màu mượt (MeshLab Style)
     pv_mesh = pv.wrap(mesh)
@@ -148,7 +157,7 @@ def main():
         pv_mesh, 
         scalars='SDF_Thickness_Cone', 
         cmap='jet_r', 
-        smooth_shading=True,
+        smooth_shading=False,
         show_edges=False,
         scalar_bar_args={'title': "SDF (Thickness)"}
     )
