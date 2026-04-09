@@ -127,7 +127,7 @@ def compute_sdf_cone(mesh, num_rays=30, cone_angle=120):
 
 def main():
     # PATH ĐẾN MODEL CỦA BẠN
-    model_path = "data/teapot.obj"
+    model_path = "data/radio_0026.off"
     try:
         mesh = trimesh.load(model_path, force='mesh')
         # Tự động sửa lỗi mesh (gộp đỉnh, xóa mặt lỗi, xóa mặt trùng...)

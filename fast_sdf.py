@@ -224,6 +224,8 @@ def cal_SDF(mesh, face_centers, face_normals, face_id, fov = 90):
 
 def main(args):
     mesh = pv.read(args.obj_file) #eg: --obj_file=./Models/158.obj
+    if not isinstance(mesh, pv.PolyData):
+        mesh = mesh.extract_surface()
     # #mesh = pv.read(".\\Models\\Synthetic\\boxtorus.obj") 
     print("Mesh loaded:", len(mesh.points), "vertices,", len(mesh.faces)/4, "faces")
     
@@ -248,7 +250,8 @@ def main(args):
     print(f"\n--- Thoi gian tinh toan: {end_time - start_time:.2f} giay ---")
 
     # Write SDF values to a text file
-    output_file = args.obj_file.replace('.obj', '.txt')
+    import os
+    output_file = os.path.splitext(args.obj_file)[0] + '.txt'
     with open(output_file, 'w') as f:
         for face_id, sdf_value in enumerate(sdf):
             f.write(f"{face_id},{sdf_value}\n")
@@ -268,6 +271,6 @@ def main(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Spherical SOM surface segmentation.")
-    parser.add_argument("--obj_file", type=str, required=False, default=r"D:\CMSVTransformer\bunny1.obj", help="Path to the OBJ file")
+    parser.add_argument("--obj_file", type=str, required=False, default=r"D:\CMSVTransformer\data\radio_0026.off", help="Path to the OBJ file")
     args = parser.parse_args()
     main(args)

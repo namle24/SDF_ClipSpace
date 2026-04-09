@@ -1,9 +1,3 @@
-"""
-fast_sdf_gpu.py
-Triển khai phương pháp GPU-Accelerated Rasterization trong không gian Clipping/NDC Space.
-ĐÃ VECTOR HÓA 100% - KHÔNG CÒN VÒNG LẶP FOR TRONG BATCH.
-"""
-
 import torch
 import numpy as np
 import pyvista as pv
@@ -12,11 +6,6 @@ import time
 from tqdm import tqdm
 
 def look_at_torch_batched(eyes, targets, device='cuda'):
-    """
-    [BƯỚC 1.A] Tạo ma trận View (B, 4, 4) song song cho toàn bộ lô Camera.
-    Đầu vào: eyes (B, 3), targets (B, 3).
-    Loại bỏ vòng lặp for, tận dụng sức mạnh GPU.
-    """
     B = eyes.shape[0]
     forward = targets - eyes
     forward = forward / (torch.norm(forward, dim=-1, keepdim=True) + 1e-12)
@@ -47,9 +36,6 @@ def look_at_torch_batched(eyes, targets, device='cuda'):
     return rotation @ translation
 
 def perspective_torch(fov_deg, near=0.001, far=5.0, device='cuda'):
-    """
-    [BƯỚC 1.B] Ma trận Perspective (4, 4) - Camera to Image Space.
-    """
     fov_rad = np.radians(fov_deg)
     cot = 1.0 / np.tan(fov_rad / 2.0)
     
@@ -63,10 +49,6 @@ def perspective_torch(fov_deg, near=0.001, far=5.0, device='cuda'):
     return P
 
 def generate_rays_ndc(fov_deg, num_rings=5, num_rays_per_ring=10, device='cuda'):
-    """
-    Sinh mảng các điểm (px, py) trên mặt phẳng 2D trong không gian NDC.
-    Các điểm này đóng vai trò là tâm các tia bắn ra từ Camera.
-    """
     tan_fov = np.tan(np.radians(fov_deg) / 2.0)
     cot = 1.0 / tan_fov
     
@@ -92,10 +74,8 @@ def generate_rays_ndc(fov_deg, num_rings=5, num_rays_per_ring=10, device='cuda')
 @torch.no_grad()
 def compute_fast_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10, batch_size=32):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n{'='*75}")
-    print(f"  ULTIMATE SDF RASTERIZER (BẮT ĐẦU VECTOR HÓA BATCH GPU)")
+    print(f" VECTOR HÓA BATCH GPU")
     print(f"  Thiết bị: {device} | Batch Size: {batch_size}")
-    print(f"{'='*75}")
 
     start_time = time.perf_counter()
 
@@ -132,9 +112,8 @@ def compute_fast_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10, ba
         b_end = min(b_start + batch_size, F)
         B = b_end - b_start
 
-        # ========================================================
-        # BƯỚC 1: Chuyển không gian Batched (View-Projection to NDC)
-        # ========================================================
+        # Chuyển không gian Batched (View-Projection to NDC)
+
         # Hướng bắn tia đâm vào lòng vật thể
         inward_batch = -normals[b_start:b_end]
         inward_batch = inward_batch / (torch.norm(inward_batch, dim=-1, keepdim=True) + 1e-12)
@@ -142,11 +121,11 @@ def compute_fast_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10, ba
         eyes = face_centers[b_start:b_end] + 0.0001 * inward_batch
         targets = eyes + inward_batch
         
-        # [NEW] Ma trận PV đa biến (B, 4, 4) - XỬ LÝ SONG SONG CẢ BATCH
+        # Ma trận PV đa biến (B, 4, 4) - XỬ LÝ SONG SONG CẢ BATCH
         V_batch = look_at_torch_batched(eyes, targets, device)
         PV_batch = P_mat @ V_batch
 
-        # [NEW] Biến đổi toàn bộ Vertices bằng einsum: (B, 4, 4) @ (4, V) -> (B, V, 4)
+        # Biến đổi toàn bộ Vertices bằng einsum: (B, 4, 4) @ (4, V) -> (B, V, 4)
         V_clip = torch.einsum('bij,jv->bvi', PV_batch, V_homo_T)
 
         # Trích xuất W và Perspective Divide
@@ -162,10 +141,9 @@ def compute_fast_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10, ba
         W1 = W[:, faces[:, 1]]
         W2 = W[:, faces[:, 2]]
 
-        # ========================================================
-        # BƯỚC 2: W-CLIPPING & Lọc Bounding Box 2D
-        # ========================================================
-        # [NEW] W-CLIPPING: Chỉ lấy tam giác có W dương (trước mặt camera) để tránh Phantom Hits
+        # W-CLIPPING & Lọc Bounding Box 2D
+
+        # W-CLIPPING: Chỉ lấy tam giác có W dương (trước mặt camera) để tránh Phantom Hits
         valid_w_mask = (W0 > 0.01) & (W1 > 0.01) & (W2 > 0.01) # (B, F)
 
         # Tính toán BBox 2D trong không gian NDC XY
@@ -183,9 +161,7 @@ def compute_fast_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10, ba
         # Kết hợp với W-Clip Mask
         in_bbox = in_bbox & valid_w_mask.unsqueeze(1)
 
-        # ========================================================
-        # BƯỚC 3: Point-in-Triangle & Z-Buffer (Z_ndc lọt [0, 1])
-        # ========================================================
+        # Point-in-Triangle & Z-Buffer (Z_ndc lọt [0, 1])
         V0_2d = V0_ndc[..., :2].unsqueeze(1) 
         V1_2d = V1_ndc[..., :2].unsqueeze(1)
         V2_2d = V2_ndc[..., :2].unsqueeze(1)
@@ -197,7 +173,7 @@ def compute_fast_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10, ba
         
         area = cross2d(V1_ndc[...,:2] - V0_ndc[...,:2], V2_ndc[...,:2] - V1_ndc[...,:2])
         area = area.unsqueeze(1)
-        # [NEW] Kiểm tra area để tránh chia cho 0
+        # Kiểm tra area để tránh chia cho 0
         valid_area = torch.abs(area) > 1e-6
 
         w0 = cross2d(V2_2d - V1_2d, P_2d - V1_2d)
@@ -216,14 +192,13 @@ def compute_fast_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10, ba
         # Độ sâu Z_ndc (0=Near, 1=Far)
         Z_hit = u * V0_ndc[...,2].unsqueeze(1) + v * V1_ndc[...,2].unsqueeze(1) + w * V2_ndc[...,2].unsqueeze(1)
         
-        # [NEW] Z-Buffer Filtering: Tìm Z gần nhất (Z_ndc nhỏ nhất)
+        # Z-Buffer Filtering: Tìm Z gần nhất (Z_ndc nhỏ nhất)
         Z_inf_hit = torch.where(in_tri, Z_hit, torch.tensor(float('inf'), device=device))
         best_z, hit_idx = torch.min(Z_inf_hit, dim=2) # (B, R)
         valid_ray = best_z < float('inf')
 
-        # ========================================================
-        # BƯỚC 4: Perspective-Correct Interpolation (Euclidean Distance)
-        # ========================================================
+        # Perspective-Correct Interpolation (Euclidean Distance)
+
         # Flatten để truy cập nhanh
         f_idx = torch.arange(B * R, device=device)
         h_idx_flat = hit_idx.view(-1)
@@ -257,12 +232,12 @@ def compute_fast_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10, ba
         sdf_values[b_start:b_end] = sdf_batch
 
     end_time = time.perf_counter()
-    print(f"\n[XUẤT SẮC] Hoàn thành trong {end_time - start_time:.4f} giây.")
+    print(f"\n Hoàn thành trong {end_time - start_time:.4f} s.")
     return sdf_values.cpu().numpy()
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Ultimate SDF Rasterizer - 100% Vectorized GPU")
+    parser = argparse.ArgumentParser(description="Ultimate SDF Rasterizer - Vectorized GPU")
     parser.add_argument("--input_file", type=str, default="data/teapot.obj")
     parser.add_argument("--fov", type=int, default=90)
     parser.add_argument("--batch_size", type=int, default=32)
