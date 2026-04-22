@@ -5,13 +5,11 @@ import trimesh
 import time
 from tqdm import tqdm
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# CÁC HÀM LÕI — GIỮ NGUYÊN Ý TƯỞNG CLIP SPACE
+# GIỮ NGUYÊN HOÀN TOÀN từ code gốc
 # ─────────────────────────────────────────────────────────────────────────────
 
 def look_at_torch_batched(eyes, targets, device='cuda'):
-    """✅ GIỮ NGUYÊN — View matrix batched"""
     B = eyes.shape[0]
     forward = targets - eyes
     forward = forward / (torch.norm(forward, dim=-1, keepdim=True) + 1e-12)
@@ -39,7 +37,6 @@ def look_at_torch_batched(eyes, targets, device='cuda'):
 
 
 def perspective_torch(fov_deg, near=0.001, far=5.0, device='cuda'):
-    """✅ GIỮ NGUYÊN — Perspective projection matrix → Clip Space"""
     fov_rad = np.radians(fov_deg)
     cot = 1.0 / np.tan(fov_rad / 2.0)
     P = torch.zeros((4, 4), dtype=torch.float32, device=device)
@@ -52,7 +49,6 @@ def perspective_torch(fov_deg, near=0.001, far=5.0, device='cuda'):
 
 
 def generate_rays_ndc(fov_deg, num_rings=5, num_rays_per_ring=10, device='cuda'):
-    """✅ GIỮ NGUYÊN — Ray sampling trong NDC space"""
     tan_fov = np.tan(np.radians(fov_deg) / 2.0)
     cot     = 1.0 / tan_fov
     all_px, all_py = [], []
@@ -68,36 +64,27 @@ def generate_rays_ndc(fov_deg, num_rings=5, num_rays_per_ring=10, device='cuda')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HÀM CHÍNH — ĐÃ FIX VÀ OPTIMIZE
+# V3: Giữ cấu trúc gốc (B, R, F), chỉ fix phần bottleneck repeat_interleave
 # ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def compute_sdf_gpu_optimized(mesh, fov_deg=90, num_rings=5,
-                               num_rays_per_ring=10, face_batch_size=512):
+def compute_sdf_gpu_v3(mesh, fov_deg=90, num_rings=5,
+                       num_rays_per_ring=10, batch_size=32):
     """
-    Pipeline lõi được GIỮ NGUYÊN:
-      World Space → Clip Space (perspective matrix)
-      → NDC (perspective divide, W-clipping)
-      → Barycentric test (2D cross product)
-      → Z-buffer (tìm opposite surface)
-      → Perspective-correct interpolation (1/W formula)
-      → Euclidean distance = SDF value
+    Giữ NGUYÊN cấu trúc code gốc hoạt động tốt.
+    Chỉ thay đúng 1 chỗ bottleneck: repeat_interleave → gather trực tiếp.
 
-    Optimization so với v1:
-      - face_batch_size tăng từ 32 → 512 (GPU utilization cao hơn)
-      - Precompute bbox TRƯỚC vòng lặp ray (tránh recompute R lần)
-      - Vectorize R rays: stack tất cả rays thành tensor (R, B, F)
-        thay vì loop R lần trong Python
-      - Fix: px.expand() → torch.full() cho scalar tensor
+    Thay đổi duy nhất:
+        TRƯỚC: W0_hit = W0.repeat_interleave(R, dim=0).view(B*R, F)[...]
+        SAU:   W0_hit = W0[b_idx, hit_idx]   (advanced indexing, O(1) memory)
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"  Device       : {device}")
-    print(f"  Face batch   : {face_batch_size}")
-    print(f"  Num rings    : {num_rings}  |  Rays/ring : {num_rays_per_ring}")
+    print(f"  Device     : {device}")
+    print(f"  Batch size : {batch_size}")
 
     start_time = time.perf_counter()
 
-    # ── Chuẩn bị dữ liệu ──────────────────────────────────────────────────
+    # ── Chuẩn bị dữ liệu — GIỮ NGUYÊN ────────────────────────────────────
     vertices     = torch.tensor(mesh.vertices,     dtype=torch.float32, device=device)
     faces_t      = torch.tensor(mesh.faces,        dtype=torch.long,    device=device)
     normals      = torch.tensor(mesh.face_normals, dtype=torch.float32, device=device)
@@ -105,60 +92,46 @@ def compute_sdf_gpu_optimized(mesh, fov_deg=90, num_rings=5,
     F_count = len(faces_t)
     V_count = len(vertices)
 
-    V0_world     = vertices[faces_t[:, 0]]                           # (F, 3)
+    V0_world     = vertices[faces_t[:, 0]]
     V1_world     = vertices[faces_t[:, 1]]
     V2_world     = vertices[faces_t[:, 2]]
-    face_centers = (V0_world + V1_world + V2_world) / 3.0           # (F, 3)
+    face_centers = (V0_world + V1_world + V2_world) / 3.0
 
-    # ✅ GIỮ NGUYÊN: Homogeneous coordinates (4, V)
     V_homo_T = torch.cat(
         [vertices, torch.ones(V_count, 1, device=device)], dim=1
     ).T  # (4, V)
 
-    # ✅ GIỮ NGUYÊN: Perspective matrix
     P_mat = perspective_torch(fov_deg, device=device)
 
-    # ✅ GIỮ NGUYÊN: Ray generation trong NDC space
     px_rays, py_rays = generate_rays_ndc(fov_deg, num_rings, num_rays_per_ring, device)
     R = len(px_rays)
-    print(f"  Total rays   : {R}")
-    print(f"  Total faces  : {F_count}")
+
+    # px/py → shape (1, R, 1) để broadcast với (B, R, F)
+    px_batch = px_rays.view(1, R, 1)
+    py_batch = py_rays.view(1, R, 1)
 
     sdf_values = torch.zeros(F_count, dtype=torch.float32, device=device)
 
-    # ── Helper ────────────────────────────────────────────────────────────
-    def cross2d(a, b):
-        """2D cross product: a[...,0]*b[...,1] - a[...,1]*b[...,0]"""
-        return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+    # ── Vòng lặp chính — GIỮ NGUYÊN cấu trúc gốc ─────────────────────────
+    for b_start in tqdm(range(0, F_count, batch_size), desc="SDF GPU v3"):
+        b_end = min(b_start + batch_size, F_count)
+        B     = b_end - b_start
 
-    # ── Vòng lặp chính theo face batch ────────────────────────────────────
-    num_batches = (F_count + face_batch_size - 1) // face_batch_size
-
-    for b_start in tqdm(range(0, F_count, face_batch_size), desc="SDF batches"):
-        b_end = min(b_start + face_batch_size, F_count)
-        B     = b_end - b_start   # số cameras trong batch này
-
-        # ── BƯỚC 1: Tính View + Projection matrix cho B cameras ──────────
-        # ✅ GIỮ NGUYÊN: inward direction từ face normal
+        # ── Clip Space pipeline — GIỮ NGUYÊN ─────────────────────────────
         inward  = -normals[b_start:b_end]
         inward  = inward / (torch.norm(inward, dim=-1, keepdim=True) + 1e-12)
         eyes    = face_centers[b_start:b_end] + 0.0001 * inward
         targets = eyes + inward
 
-        # ✅ GIỮ NGUYÊN: Look-at → View matrix
-        V_mat  = look_at_torch_batched(eyes, targets, device)  # (B, 4, 4)
-        PV_mat = P_mat @ V_mat                                 # (B, 4, 4)
+        V_mat  = look_at_torch_batched(eyes, targets, device)
+        PV_mat = P_mat @ V_mat
 
-        # ── BƯỚC 2: Transform tất cả vertices → Clip Space ───────────────
-        # ✅ GIỮ NGUYÊN: einsum (B,4,4) @ (4,V) → (B,V,4)
         V_clip = torch.einsum('bij,jv->bvi', PV_mat, V_homo_T)  # (B, V, 4)
 
-        # ✅ GIỮ NGUYÊN: W-clipping + Perspective divide → NDC
-        W      = V_clip[..., 3]                                 # (B, V)
+        W      = V_clip[..., 3]                                  # (B, V)
         W_safe = W.clamp(min=1e-8)
-        NDC    = V_clip[..., :3] / W_safe.unsqueeze(-1)         # (B, V, 3)
+        NDC    = V_clip[..., :3] / W_safe.unsqueeze(-1)          # (B, V, 3)
 
-        # ✅ GIỮ NGUYÊN: Tọa độ 3 đỉnh tam giác trong NDC
         V0_ndc = NDC[:, faces_t[:, 0], :]   # (B, F, 3)
         V1_ndc = NDC[:, faces_t[:, 1], :]
         V2_ndc = NDC[:, faces_t[:, 2], :]
@@ -166,135 +139,106 @@ def compute_sdf_gpu_optimized(mesh, fov_deg=90, num_rings=5,
         W1     = W[:, faces_t[:, 1]]
         W2     = W[:, faces_t[:, 2]]
 
-        # ✅ GIỮ NGUYÊN: W-clipping mask (loại phantom faces)
-        valid_w = (W0 > 0.01) & (W1 > 0.01) & (W2 > 0.01)      # (B, F)
+        # W-clipping — GIỮ NGUYÊN
+        valid_w = (W0 > 0.01) & (W1 > 0.01) & (W2 > 0.01)
 
-        # ── BƯỚC 3: Precompute bbox VÀ area cho TẤT CẢ rays ─────────────
-        # KEY OPTIMIZATION: Tính 1 lần, dùng cho tất cả R rays
-        all_x  = torch.stack([V0_ndc[..., 0], V1_ndc[..., 0], V2_ndc[..., 0]], dim=-1)
-        all_y  = torch.stack([V0_ndc[..., 1], V1_ndc[..., 1], V2_ndc[..., 1]], dim=-1)
-        min_x  = all_x.min(dim=-1).values   # (B, F)
-        max_x  = all_x.max(dim=-1).values
-        min_y  = all_y.min(dim=-1).values
-        max_y  = all_y.max(dim=-1).values
+        # Bbox 2D — GIỮ NGUYÊN
+        all_x = torch.stack([V0_ndc[..., 0], V1_ndc[..., 0], V2_ndc[..., 0]], dim=-1)
+        all_y = torch.stack([V0_ndc[..., 1], V1_ndc[..., 1], V2_ndc[..., 1]], dim=-1)
+        min_x = all_x.min(dim=-1).values    # (B, F)
+        max_x = all_x.max(dim=-1).values
+        min_y = all_y.min(dim=-1).values
+        max_y = all_y.max(dim=-1).values
 
-        # ✅ GIỮ NGUYÊN: Triangle area trong NDC (cho barycentric)
-        area       = cross2d(
-            V1_ndc[..., :2] - V0_ndc[..., :2],
-            V2_ndc[..., :2] - V1_ndc[..., :2]
-        )  # (B, F)
-        valid_area = torch.abs(area) > 1e-6  # (B, F)
-
-        # Combine static masks (không đổi theo ray)
-        static_mask = valid_w & valid_area   # (B, F)
-
-        # ── BƯỚC 4: Vectorize TẤT CẢ R rays ─────────────────────────────
-        # FIX CHÍNH: Thay vì loop R lần trong Python,
-        # stack rays thành tensor rồi xử lý song song
-
-        # px_rays: (R,) → broadcast thành (R, B, F) để check bbox
-        # min_x:   (B, F) → unsqueeze(0) → (1, B, F)
-
-        px_r = px_rays.view(R, 1, 1)   # (R, 1, 1)
-        py_r = py_rays.view(R, 1, 1)   # (R, 1, 1)
-
-        # Bbox filter cho tất cả rays cùng lúc: (R, B, F)
         in_bbox = (
-            (px_r >= min_x.unsqueeze(0)) & (px_r <= max_x.unsqueeze(0)) &
-            (py_r >= min_y.unsqueeze(0)) & (py_r <= max_y.unsqueeze(0))
-        ) & static_mask.unsqueeze(0)   # (R, B, F)
+            (px_batch >= min_x.unsqueeze(1)) & (px_batch <= max_x.unsqueeze(1)) &
+            (py_batch >= min_y.unsqueeze(1)) & (py_batch <= max_y.unsqueeze(1))
+        ) & valid_w.unsqueeze(1)  # (B, R, F)
 
-        # ✅ GIỮ NGUYÊN: Barycentric coords trong NDC
-        # P_2d: (R, B, F, 2)
-        P_2d = torch.stack([
-            px_r.expand(R, B, F_count),
-            py_r.expand(R, B, F_count)
-        ], dim=-1)   # (R, B, F, 2)
+        # Barycentric — GIỮ NGUYÊN
+        V0_2d = V0_ndc[..., :2].unsqueeze(1)   # (B, 1, F, 2)
+        V1_2d = V1_ndc[..., :2].unsqueeze(1)
+        V2_2d = V2_ndc[..., :2].unsqueeze(1)
+        P_2d  = torch.stack([px_batch, py_batch], dim=-1).expand(B, R, F_count, 2)
 
-        # V0,V1,V2 NDC 2D: (B, F, 2) → unsqueeze(0) → (1, B, F, 2)
-        V0_2d = V0_ndc[..., :2].unsqueeze(0)   # (1, B, F, 2)
-        V1_2d = V1_ndc[..., :2].unsqueeze(0)
-        V2_2d = V2_ndc[..., :2].unsqueeze(0)
+        def cross2d(a, b):
+            return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
-        # ✅ GIỮ NGUYÊN: 2D cross product cho barycentric
-        w0 = cross2d(V2_2d - V1_2d, P_2d - V1_2d)   # (R, B, F)
+        area       = cross2d(V1_ndc[..., :2] - V0_ndc[..., :2],
+                             V2_ndc[..., :2] - V1_ndc[..., :2])  # (B, F)
+        valid_area = (torch.abs(area) > 1e-6).unsqueeze(1)        # (B, 1, F)
+
+        w0 = cross2d(V2_2d - V1_2d, P_2d - V1_2d)   # (B, R, F)
         w1 = cross2d(V0_2d - V2_2d, P_2d - V2_2d)
         w2 = cross2d(V1_2d - V0_2d, P_2d - V0_2d)
 
-        in_tri = in_bbox & (
+        in_tri = in_bbox & valid_area & (
             ((w0 >= 0) & (w1 >= 0) & (w2 >= 0)) |
             ((w0 <= 0) & (w1 <= 0) & (w2 <= 0))
-        )  # (R, B, F)
+        )  # (B, R, F)
 
-        # ✅ GIỮ NGUYÊN: Tính u, v, w (barycentric)
-        area_r = area.unsqueeze(0).expand(R, B, F_count)   # (R, B, F)
-        u = torch.where(in_tri, w0 / area_r, torch.zeros_like(w0))
-        v = torch.where(in_tri, w1 / area_r, torch.zeros_like(w1))
-        w = 1.0 - u - v
+        area_br = area.unsqueeze(1).expand(B, R, F_count)
+        u = torch.where(in_tri, w0 / area_br, torch.zeros_like(w0))  # (B, R, F)
+        v = torch.where(in_tri, w1 / area_br, torch.zeros_like(w1))
+        w_bary = 1.0 - u - v
 
-        # ✅ GIỮ NGUYÊN: Z-buffer trong NDC
-        Z0 = V0_ndc[..., 2].unsqueeze(0)   # (1, B, F)
-        Z1 = V1_ndc[..., 2].unsqueeze(0)
-        Z2 = V2_ndc[..., 2].unsqueeze(0)
+        # Z-buffer — GIỮ NGUYÊN
+        Z_hit = (u * V0_ndc[..., 2].unsqueeze(1) +
+                 v * V1_ndc[..., 2].unsqueeze(1) +
+                 w_bary * V2_ndc[..., 2].unsqueeze(1))   # (B, R, F)
 
-        Z_hit = u * Z0 + v * Z1 + w * Z2   # (R, B, F)
         Z_inf = torch.where(in_tri, Z_hit,
                             torch.full_like(Z_hit, float('inf')))
+        best_z, hit_idx = torch.min(Z_inf, dim=2)   # (B, R)
+        valid_ray = best_z < float('inf')            # (B, R)
 
-        # ✅ GIỮ NGUYÊN: Tìm face gần nhất (Z nhỏ nhất) cho mỗi (ray, camera)
-        best_z, hit_idx = torch.min(Z_inf, dim=2)   # (R, B)
-        valid_ray = best_z < float('inf')            # (R, B)
+        # ── FIX DUY NHẤT: Thay repeat_interleave → gather trực tiếp ──────
+        #
+        # Code gốc (chậm):
+        #   W0_hit = W0.repeat_interleave(R, dim=0).view(B*R, F)[f_idx, h_idx_flat]
+        #   → Nhân bản W0 lên R=150 lần trong memory → B*R*F elements
+        #
+        # V3 (nhanh):
+        #   b_idx[i,j] = i  →  chọn camera thứ i
+        #   hit_idx[i,j]    →  chọn face bị hit bởi ray j của camera i
+        #   → Gather trực tiếp, không cần nhân bản
+        #
+        b_idx = torch.arange(B, device=device).unsqueeze(1).expand(B, R)  # (B, R)
 
-        # ── BƯỚC 5: Perspective-correct interpolation ─────────────────────
-        # ✅ GIỮ NGUYÊN: 1/W interpolation formula của GPU rasterizer
-        # Gather barycentric coords tại hit triangle
-        rb_idx = torch.arange(R, device=device).unsqueeze(1).expand(R, B)  # (R, B)
-        b_idx  = torch.arange(B, device=device).unsqueeze(0).expand(R, B)  # (R, B)
+        u_h   = u[b_idx,   torch.arange(R, device=device).unsqueeze(0).expand(B, R), hit_idx]
+        v_h   = v[b_idx,   torch.arange(R, device=device).unsqueeze(0).expand(B, R), hit_idx]
+        # Gọn hơn với gather:
+        u_h   = u.gather(2, hit_idx.unsqueeze(2)).squeeze(2)       # (B, R)
+        v_h   = v.gather(2, hit_idx.unsqueeze(2)).squeeze(2)
+        w_h   = 1.0 - u_h - v_h
 
-        u_h = u[rb_idx, b_idx, hit_idx]   # (R, B)
-        v_h = v[rb_idx, b_idx, hit_idx]
-        w_h = 1.0 - u_h - v_h
+        W0_h  = W0.gather(1, hit_idx.view(B, R))   # (B, R)  ← KHÔNG cần repeat
+        W1_h  = W1.gather(1, hit_idx.view(B, R))
+        W2_h  = W2.gather(1, hit_idx.view(B, R))
 
-        # Gather W của 3 đỉnh tại hit triangle
-        W0_r = W0.unsqueeze(0).expand(R, B, F_count)   # (R, B, F)
-        W1_r = W1.unsqueeze(0).expand(R, B, F_count)
-        W2_r = W2.unsqueeze(0).expand(R, B, F_count)
+        # ── Perspective-correct interpolation — GIỮ NGUYÊN ────────────────
+        inv_W    = u_h / W0_h + v_h / W1_h + w_h / W2_h   # (B, R)
+        W_interp = 1.0 / (inv_W + 1e-12)
 
-        W0_h = W0_r[rb_idx, b_idx, hit_idx]   # (R, B)
-        W1_h = W1_r[rb_idx, b_idx, hit_idx]
-        W2_h = W2_r[rb_idx, b_idx, hit_idx]
+        # Gather world-space vertices tại hit face — dùng gather thay expand
+        hit_idx_3d = hit_idx.unsqueeze(2).expand(B, R, 3)   # (B, R, 3)
+        V0_h = V0_world[hit_idx.view(-1)].view(B, R, 3)     # (B, R, 3)
+        V1_h = V1_world[hit_idx.view(-1)].view(B, R, 3)
+        V2_h = V2_world[hit_idx.view(-1)].view(B, R, 3)
 
-        # ✅ GIỮ NGUYÊN: 1/W formula — perspective-correct
-        inv_W   = u_h / W0_h + v_h / W1_h + w_h / W2_h   # (R, B)
-        W_interp = 1.0 / (inv_W + 1e-12)                  # (R, B)
-
-        # Gather world-space vertices tại hit triangle
-        V0_r = V0_world.unsqueeze(0).unsqueeze(0).expand(R, B, F_count, 3)
-        V1_r = V1_world.unsqueeze(0).unsqueeze(0).expand(R, B, F_count, 3)
-        V2_r = V2_world.unsqueeze(0).unsqueeze(0).expand(R, B, F_count, 3)
-
-        hit_idx_3d = hit_idx.unsqueeze(-1).expand(R, B, 3)   # (R, B, 3)
-        V0_h = V0_r[rb_idx, b_idx, hit_idx]    # (R, B, 3)
-        V1_h = V1_r[rb_idx, b_idx, hit_idx]
-        V2_h = V2_r[rb_idx, b_idx, hit_idx]
-
-        # ✅ GIỮ NGUYÊN: Reconstruct 3D hit point
         hit_point = W_interp.unsqueeze(-1) * (
             (u_h / W0_h).unsqueeze(-1) * V0_h +
             (v_h / W1_h).unsqueeze(-1) * V1_h +
             (w_h / W2_h).unsqueeze(-1) * V2_h
-        )  # (R, B, 3)
+        )  # (B, R, 3)
 
-        # ✅ GIỮ NGUYÊN: Euclidean distance = SDF value
-        fc_batch = face_centers[b_start:b_end]              # (B, 3)
-        dists    = torch.norm(
-            hit_point - fc_batch.unsqueeze(0), dim=-1
-        )  # (R, B)
+        # Euclidean distance — GIỮ NGUYÊN
+        fc_b  = face_centers[b_start:b_end].unsqueeze(1)    # (B, 1, 3)
+        dists = torch.norm(hit_point - fc_b, dim=-1)         # (B, R)
 
-        # Aggregate: trung bình các ray hợp lệ
-        valid_f  = valid_ray.float()                        # (R, B)
-        dist_sum = (dists * valid_f).sum(dim=0)             # (B,)
-        hit_cnt  = valid_f.sum(dim=0)                       # (B,)
+        valid_f  = valid_ray.float()
+        dist_sum = (dists * valid_f).sum(dim=1)              # (B,)
+        hit_cnt  = valid_f.sum(dim=1)                        # (B,)
 
         sdf_values[b_start:b_end] = dist_sum / (hit_cnt + 1e-8)
 
@@ -309,36 +253,35 @@ def compute_sdf_gpu_optimized(mesh, fov_deg=90, num_rings=5,
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="SDF GPU Rasterizer v2 - Optimized")
-    parser.add_argument("--input_file",      type=str,   default="data/bunny.obj")
-    parser.add_argument("--fov",             type=int,   default=90)
-    parser.add_argument("--face_batch_size", type=int,   default=512)
-    parser.add_argument("--num_rings",       type=int,   default=5)
-    parser.add_argument("--rays_per_ring",   type=int,   default=10)
+    parser = argparse.ArgumentParser(description="SDF GPU Rasterizer v3")
+    parser.add_argument("--input_file",  type=str, default="data/bunny.obj")
+    parser.add_argument("--fov",         type=int, default=120)
+    parser.add_argument("--batch_size",  type=int, default=32)
+    parser.add_argument("--num_rings",   type=int, default=15)
+    parser.add_argument("--rays_per_ring", type=int, default=30)
     args = parser.parse_args()
 
     try:
         mesh = trimesh.load(args.input_file, force='mesh')
         mesh.fix_normals()
         mesh.process()
-        print(f"Mesh loaded: {len(mesh.faces)} faces, {len(mesh.vertices)} vertices")
+        print(f"Mesh: {len(mesh.faces)} faces | {len(mesh.vertices)} vertices")
     except Exception as e:
-        print(f"Error loading mesh: {e}")
+        print(f"Error: {e}")
         return
 
-    sdf = compute_sdf_gpu_optimized(
+    sdf = compute_sdf_gpu_v3(
         mesh,
-        fov_deg        = args.fov,
-        num_rings      = args.num_rings,
+        fov_deg           = args.fov,
+        num_rings         = args.num_rings,
         num_rays_per_ring = args.rays_per_ring,
-        face_batch_size = args.face_batch_size
+        batch_size        = args.batch_size,
     )
 
-    # Visualize
     pv_mesh = pv.wrap(mesh)
-    pv_mesh.cell_data['SDF_v2'] = sdf
-    plotter = pv.Plotter(title="SDF GPU Rasterizer v2")
-    plotter.add_mesh(pv_mesh, scalars='SDF_v2', cmap='jet_r', show_edges=True)
+    pv_mesh.cell_data['SDF_v3'] = sdf
+    plotter = pv.Plotter(title="SDF GPU Rasterizer v3")
+    plotter.add_mesh(pv_mesh, scalars='SDF_v3', cmap='jet_r', show_edges=True)
     plotter.set_background('white')
     plotter.show()
 
