@@ -5,6 +5,9 @@ import trimesh
 import sys
 import torch
 
+# Add parent directory and src to path to handle package imports
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 # Monkey patch tqdm to be completely silent
 import tqdm
 import builtins
@@ -22,9 +25,9 @@ class DummyTqdm:
 tqdm.tqdm = DummyTqdm
 sys.modules['tqdm'].tqdm = DummyTqdm
 
-from sdf_calculator import compute_sdf_cone
-from custom_ortho_sdf import compute_custom_ortho_sdf
-from custom_ortho_sdf_gpu import compute_custom_ortho_sdf_gpu
+from src.core.sdf_calculator import compute_sdf_cone
+from src.core.custom_ortho_sdf import compute_custom_ortho_sdf
+from src.core.custom_ortho_sdf_gpu import compute_custom_ortho_sdf_gpu
 
 class HiddenPrints:
     def __enter__(self):
@@ -40,14 +43,14 @@ def main():
     test_files = [
         'data/radio_0026.off',
         'data/wardrobe_0032.off',
-        'data/bunny.obj'
+        'data/bunny1.obj'
     ]
     
     results = []
-    header = ["Tên Model", "Số Đỉnh", "Thông thường (Meshlab)", "Vectorized (CPU)", "Vectorized GPU", "GPU so với CPU", "GPU so với Meshlab"]
+    header = ["Model Name", "Vertex Count", "Standard (Meshlab)", "Vectorized (CPU)", "Vectorized GPU", "GPU vs CPU", "GPU vs Meshlab"]
     results.append(header)
     
-    print("Đang khởi động tiến trình đánh giá hiệu năng (Benchmarking)\n")
+    print("Starting Performance Benchmarking...\n")
     if torch.cuda.is_available():
         with HiddenPrints():
             dummy = trimesh.creation.box()
@@ -59,7 +62,7 @@ def main():
              continue
              
         filename = os.path.basename(f)
-        print(f"[*] Đang thực thi model: {filename} ... ", end="")
+        print(f"[*] Benchmarking model: {filename} ... ", end="")
         sys.stdout.flush()
         
         try:
@@ -67,10 +70,10 @@ def main():
                 mesh = trimesh.load(f, force='mesh')
             num_vertices = len(mesh.vertices)
         except Exception:
-            print(f"Lỗi tải mesh!")
+            print(f"Mesh loading error!")
             continue
             
-        # 1. Meshlab
+        # 1. Meshlab Style (Serial)
         try:
             with HiddenPrints():
                 t0 = time.perf_counter()
@@ -80,7 +83,7 @@ def main():
         except Exception:
             time_meshlab = float('nan')
             
-        # 2. CPU VO-SDF
+        # 2. CPU Vectorized
         try:
             with HiddenPrints():
                 t0 = time.perf_counter()
@@ -90,7 +93,7 @@ def main():
         except Exception:
             time_cpu = float('nan')
             
-        # 3. GPU VO-SDF
+        # 3. GPU Vectorized
         try:
             with HiddenPrints():
                 t0 = time.perf_counter()
@@ -111,13 +114,13 @@ def main():
             f"{time_meshlab:.3f} s",
             f"{time_cpu:.3f} s",
             f"{time_gpu:.3f} s",
-            f"Nhanh hơn {speedup_cpu:.1f}x",
-            f"Nhanh hơn {speedup_mesh:.1f}x"
+            f"{speedup_cpu:.1f}x faster",
+            f"{speedup_mesh:.1f}x faster"
         ])
-        print("Hoàn tất!")
+        print("Done!")
         
     print("\n" + "="*110)
-    print(f"{'BẢNG ĐO LƯỜNG TỐC ĐỘ THỰC THI SDF (30 TIA) - KHÓA LUẬN KHOA HỌC'.center(110)}")
+    print(f"{'SDF PERFORMANCE BENCHMARK (30 RAYS)'.center(110)}")
     print("="*110)
     
     col_widths = [max(len(str(item)) for item in col) for col in zip(*results)]

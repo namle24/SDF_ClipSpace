@@ -1,24 +1,24 @@
 """
-sdf_calculator_gpu.py — Nâng cấp: Clip-Space Möller-Trumbore SDF trên GPU
+sdf_calculator_gpu.py — Optimized: Clip-Space Möller-Trumbore SDF on GPU
 
-Kiến trúc Hybrid:
+Hybrid Architecture:
   ┌─────────────────────────────────────────────────────────────────────┐
-  │  GIAI ĐOẠN 1 (Ý tưởng Giáo sư):                                  │
-  │    look_at(eye, target) → V          Ma trận View  4×4            │
-  │    perspective(fov, near, far) → P   Ma trận Projection 4×4       │
-  │    PV = P @ V                                                     │
-  │    vertices_clip = (PV @ verts_homo.T).T   ← Perspective Divide   │
-  │    ⇒ Chùm tia nón (Cone) trong World Space                       │
-  │       được NẮN THẲNG thành chùm tia SONG SONG dọc trục Z         │
-  │       trong Clipping Space.                                       │
+  │  PHASE 1 (View-Projection Transformation):                         │
+  │    look_at(eye, target) → V          View Matrix  4×4               │
+  │    perspective(fov, near, far) → P   Projection Matrix 4×4          │
+  │    PV = P @ V                                                       │
+  │    vertices_clip = (PV @ verts_homo.T).T   ← Perspective Divide     │
+  │    ⇒ Perspective Cone in World Space                                │
+  │       is straightened into PARALLEL rays along the Z-axis           │
+  │       in Clipping Space.                                            │
   ├─────────────────────────────────────────────────────────────────────┤
-  │  GIAI ĐOẠN 2 (Lõi GPU của chúng ta):                              │
-  │    Sinh lưới tia song song D = [0, 0, -1] trên mặt phẳng XY      │
-  │    (vòng tròn đồng tâm — Ring Pattern của Giáo sư).               │
-  │    Đưa tam giác ĐÃ BIẾN ĐỔI + tia song song vào                  │
-  │    Möller-Trumbore Batched GPU → tìm (u, v, t).                   │
-  │    Dùng (u, v) nội suy ngược hit point trong WORLD SPACE          │
-  │    → Tính khoảng cách Euclid chính xác.                           │
+  │  PHASE 2 (GPU Core):                                                │
+  │    Generate parallel ray grid D = [0, 0, 1] on XY plane             │
+  │    (Concentric rings pattern).                                      │
+  │    Feed TRANSFORMED triangles + parallel rays into                 │
+  │    Möller-Trumbore Batched GPU → find (u, v, t).                   │
+  │    Use (u, v) to interpolate hit point in WORLD SPACE               │
+  │    → Calculate exact Euclidean distance.                            │
   └─────────────────────────────────────────────────────────────────────┘
 """
 
@@ -31,18 +31,18 @@ from tqdm import tqdm
 
 
 # =====================================================================
-# 1. CAMERA MATRICES — PyTorch GPU (dịch nguyên bản từ fast_sdf.py)
+# 1. CAMERA MATRICES — PyTorch GPU
 # =====================================================================
 
 def look_at_torch(eye, target, device='cuda'):
     """
-    Ma trận View 4×4:  World Space → Camera Space.
-    Giữ nguyên logic Gram–Schmidt random-up của Giáo sư.
+    4x4 View Matrix: World Space → Camera Space.
+    Implements Gram–Schmidt orthogonalization with a randomized up vector.
     """
     forward = target - eye
     forward = forward / (torch.norm(forward) + 1e-12)
 
-    # Random up → chiếu vuông góc → right → true_up  (Gram-Schmidt)
+    # Random up vector -> orthogonal projection -> right -> true_up (Gram-Schmidt)
     up = torch.randn(3, device=device, dtype=torch.float32)
     up = up - torch.dot(up, forward) * forward
     up = up / (torch.norm(up) + 1e-12)
@@ -68,8 +68,8 @@ def look_at_torch(eye, target, device='cuda'):
 
 def perspective_torch(fov_rad, near, far, device='cuda'):
     """
-    Ma trận Projection 4×4:  Camera Space → Clip Space.
-    Công thức giống hệt perspective() trong fast_sdf.py.
+    4x4 Projection Matrix: Camera Space → Clip Space.
+    Standard perspective projection formula.
     """
     cot = 1.0 / torch.tan(fov_rad / 2)
     P = torch.zeros((4, 4), dtype=torch.float32, device=device)
@@ -82,16 +82,16 @@ def perspective_torch(fov_rad, near, far, device='cuda'):
 
 
 # =====================================================================
-# 2. SINH LƯỚI TIA SONG SONG TRONG CLIP SPACE (Ring Pattern)
+# 2. PARALLEL RAY GENERATION IN CLIP SPACE (Ring Pattern)
 # =====================================================================
 
 def generate_clip_space_rays(fov_rad, num_rings=5, num_rays_per_ring=10, device='cuda'):
     """
-    Sinh chùm tia song song D=[0,0,-1] trên mặt phẳng XY của Clip Space.
-    Vòng tròn đồng tâm (Ring) — giữ nguyên logic sinh tia của Giáo sư.
+    Generates parallel rays D=[0,0,1] on the XY plane in Clip Space.
+    Concentric ring pattern for even distribution.
     
     Returns:
-        ray_origins_xy: (R, 2) — tọa độ XY gốc phát tia trong Clip Space
+        ray_origins_xy: (R, 2) — XY coordinates of ray origins in Clip Space
     """
     tan_fov = torch.tan(fov_rad / 2)
     all_xy = []
@@ -106,29 +106,30 @@ def generate_clip_space_rays(fov_rad, num_rings=5, num_rays_per_ring=10, device=
 
 
 # =====================================================================
-# 3. MÖLLER-TRUMBORE TRÊN CLIP SPACE — Lõi GPU Batching
+# 3. CLIP SPACE MÖLLER-TRUMBORE — GPU Batching Core
 # =====================================================================
 
 def moller_trumbore_clip_batch(ray_origins, ray_dir, V0c, V1c, V2c,
                                V0w, V1w, V2w,
                                umbrella_mask, ray_batch_size, device):
     """
-    Möller-Trumbore GPU Batching trong Clip Space.
-    Tia song song D=[0,0,-1], gốc tại (px, py, 0).
+    Batched Möller-Trumbore intersection on GPU in Clip Space.
+    Parallel rays D=[0,0,1], origin at (px, py, -0.01).
     
-    Trả về (u_hit, v_hit, face_hit_idx, hit_valid) cho mỗi tia.
-    Barycentric coords (u,v) để nội suy lại World Space.
+    Returns (hit_world, hit_valid) for each ray.
+    Uses Barycentric coordinates (u,v) to interpolate back to World Space.
     
     Args:
-        ray_origins:    (R, 3) — gốc tia trong Clip Space
-        ray_dir:        (3,)   — hướng tia [0, 0, -1]
-        V0c, V1c, V2c:  (Fv, 3) — đỉnh tam giác trong Clip Space (đã lọc)
-        V0w, V1w, V2w:  (Fv, 3) — đỉnh tam giác trong World Space (để nội suy)
-        umbrella_mask:  (Fv,) bool — mặt chứa đỉnh gốc = True
+        ray_origins:    (R, 3) — Ray origins in Clip Space
+        ray_dir:        (3,)   — Ray direction [0, 0, 1]
+        V0c, V1c, V2c:  (Fv, 3) — Triangle vertices in Clip Space (filtered)
+        V0w, V1w, V2w:  (Fv, 3) — Triangle vertices in World Space (for interpolation)
+        umbrella_mask:  (Fv,) bool — True if face contains the source vertex
         ray_batch_size: int
     
     Returns:
-        hit_distances: (R,) — khoảng cách Euclid World Space (inf nếu miss)
+        hit_world: (R, 3) — Euclidean World Space hit points
+        hit_valid: (R,)   — Boolean mask of valid intersections
     """
     R = len(ray_origins)
     Fv = len(V0c)
@@ -149,21 +150,20 @@ def moller_trumbore_clip_batch(ray_origins, ray_dir, V0c, V1c, V2c,
         
         O_batch = ray_origins[i:end]  # (B, 3)
         
-        # Möller-Trumbore: P = D × E2  (broadcast D over F faces)
-        # D shape (1,3), E2c shape (Fv,3) → P shape (Fv, 3), shared across batch
+        # Möller-Trumbore: P = D × E2 (broadcast D over F faces)
         P = torch.linalg.cross(D.expand(Fv, 3), E2c)  # (Fv, 3)
         
         # a = E1 · P
         a = torch.sum(E1c * P, dim=-1)  # (Fv,)
         
-        # Lọc mặt gần song song với tia
+        # Filter near-parallel faces
         face_valid = torch.abs(a) > 1e-8  # (Fv,)
-        face_valid = face_valid & (~umbrella_mask)  # Loại Umbrella
+        face_valid = face_valid & (~umbrella_mask)  # Exclude source faces
         
         safe_a = torch.where(face_valid, a, torch.ones_like(a))
         f = 1.0 / safe_a  # (Fv,)
         
-        # s = O - V0  →  (B, Fv, 3)
+        # s = O - V0 -> (B, Fv, 3)
         s = O_batch.unsqueeze(1) - V0c.unsqueeze(0)  # (B, Fv, 3)
         
         # u_bary = f * (s · P)
@@ -180,19 +180,19 @@ def moller_trumbore_clip_batch(ray_origins, ray_dir, V0c, V1c, V2c,
         
         # t = f * (E2 · Q)
         t = f.unsqueeze(0) * torch.sum(E2c.unsqueeze(0) * Q, dim=-1)  # (B, Fv)
-        bary_valid = bary_valid & (t > 1e-4)  # Phía trước tia
+        bary_valid = bary_valid & (t > 1e-4)  # Points ahead of ray
         
-        # Đặt những miss = inf
+        # Set misses to inf
         t = torch.where(bary_valid, t, torch.tensor(float('inf'), device=device))
         
-        # Tìm mặt gần nhất cho mỗi tia trong batch
+        # Find nearest face for each ray in batch
         min_t, min_idx = torch.min(t, dim=-1)  # (B,)
         
-        # Cập nhật best nếu t nhỏ hơn
+        # Update best if closer intersection found
         update_mask = min_t < best_t[i:end]
         best_t[i:end] = torch.where(update_mask, min_t, best_t[i:end])
         
-        # Lấy u, v tại face gần nhất
+        # Extract barycentric coords at intersection
         batch_arange = torch.arange(B, device=device)
         u_at_min = u_bary[batch_arange, min_idx]
         v_at_min = v_bary[batch_arange, min_idx]
@@ -201,7 +201,7 @@ def moller_trumbore_clip_batch(ray_origins, ray_dir, V0c, V1c, V2c,
         best_v[i:end] = torch.where(update_mask, v_at_min, best_v[i:end])
         best_face[i:end] = torch.where(update_mask, min_idx, best_face[i:end])
     
-    # Nội suy hit point trong WORLD SPACE bằng Barycentric
+    # Interpolate hit point in World Space using Barycentric coordinates
     hit_valid = best_t < float('inf')
     
     w_bary = 1.0 - best_u - best_v  # (R,)
@@ -213,27 +213,27 @@ def moller_trumbore_clip_batch(ray_origins, ray_dir, V0c, V1c, V2c,
 
 
 # =====================================================================
-# 4. ENGINE CHÍNH — Clip-Space + Möller-Trumbore GPU
+# 4. MAIN ENGINE — Clip-Space + Möller-Trumbore GPU
 # =====================================================================
 
 @torch.no_grad()
 def compute_sdf_clipspace_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
-                              vertex_batch_size=64, ray_batch_size=4096):
+                               vertex_batch_size=64, ray_batch_size=4096):
     """
-    SDF Calculation kết hợp:
-      - View-Projection (Giáo sư) chuyển mesh sang Clip Space
-      - Möller-Trumbore GPU (chúng ta) tìm Hitting Point
-      - Nội suy Barycentric ngược World Space tính khoảng cách chính xác
+    Calculates SDF values for all vertices using:
+      - View-Projection transformation to Clip Space
+      - GPU-accelerated Möller-Trumbore intersection
+      - World-space distance calculation via Barycentric interpolation
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\n{'='*60}")
     print(f"  CLIP-SPACE MÖLLER-TRUMBORE SDF ENGINE (GPU)")
-    print(f"  Thiết bị: {device}")
+    print(f"  Device: {device}")
     print(f"{'='*60}")
 
     start_time = time.perf_counter()
 
-    # --- Tải dữ liệu lên VRAM ---
+    # --- Data upload to VRAM ---
     vertices = torch.tensor(mesh.vertices, dtype=torch.float32, device=device)
     normals = torch.tensor(mesh.vertex_normals, dtype=torch.float32, device=device)
     faces = torch.tensor(mesh.faces, dtype=torch.long, device=device)
@@ -241,11 +241,11 @@ def compute_sdf_clipspace_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=1
     N = len(vertices)
     F = len(faces)
 
-    # Homogeneous (tính 1 lần)
+    # Pre-calculate Homogeneous coordinates
     ones = torch.ones((N, 1), dtype=torch.float32, device=device)
     verts_homo = torch.cat([vertices, ones], dim=-1)  # (N, 4)
 
-    # World-Space triangle vertices (bất biến — dùng để nội suy cuối cùng)
+    # World-Space triangle vertices (static — used for final interpolation)
     V0w = vertices[faces[:, 0]]  # (F, 3)
     V1w = vertices[faces[:, 1]]
     V2w = vertices[faces[:, 2]]
@@ -256,35 +256,34 @@ def compute_sdf_clipspace_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=1
     bbox_diag = torch.norm(vertices.max(dim=0).values - vertices.min(dim=0).values)
     far = bbox_diag + 1.0
 
-    # Ma trận Projection (chung cho mọi đỉnh)
+    # Projection Matrix (static for all viewpoints)
     P = perspective_torch(fov_rad, near, far, device)
 
-    # Sinh lưới tia song song 1 lần
+    # Pre-generate parallel ray pattern
     ray_xy = generate_clip_space_rays(fov_rad, num_rings, num_rays_per_ring, device)
     R = len(ray_xy)
-    # Gốc tia trong NDC: (px, py, z_start)
-    # Sau Perspective Divide của Giáo sư, NDC z nằm trong khoảng [0..1] (near→far).
-    # Camera nhìn theo -Z trong Camera Space → sau phép chiếu, vật thể nằm ở Z dương trong NDC.
-    # Đặt gốc tia ngay mặt phẳng Near (z ≈ 0) và bắn dọc Z+ hướng vào sâu.
+    
+    # Ray origins in NDC space
     ray_origins_clip = torch.zeros((R, 3), dtype=torch.float32, device=device)
     ray_origins_clip[:, 0] = ray_xy[:, 0]
     ray_origins_clip[:, 1] = ray_xy[:, 1]
-    ray_origins_clip[:, 2] = -0.01  # Hơi trước mặt phẳng Near
-    # Hướng tia: D = [0, 0, +1] (dọc trục Z dương trong NDC)
+    ray_origins_clip[:, 2] = -0.01  # Slightly offset from near plane
+    
+    # Ray direction: D = [0, 0, 1] (along positive Z in NDC)
     ray_dir = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=device)
 
-    print(f"[*] Mesh: {N} đỉnh, {F} tam giác")
-    print(f"[*] Tia/đỉnh: {R} | FOV: {fov_deg}° | Near/Far: {near.item():.3f}/{far.item():.1f}")
+    print(f"[*] Mesh: {N} vertices, {F} triangles")
+    print(f"[*] Rays/Vertex: {R} | FOV: {fov_deg}° | Near/Far: {near.item():.3f}/{far.item():.1f}")
 
     sdf_values = torch.zeros(N, dtype=torch.float32, device=device)
 
-    # --- Xử lý theo Batch đỉnh ---
+    # --- Vertex Batch Processing ---
     for b_start in tqdm(range(0, N, vertex_batch_size),
-                        desc="Clip-Space MT Batches"):
+                        desc="Clip-Space MT Processing"):
         b_end = min(b_start + vertex_batch_size, N)
 
         for idx in range(b_start, b_end):
-            # ========== GIAI ĐOẠN 1: View-Projection (Giáo sư) ==========
+            # PHASE 1: View-Projection Transformation
             inward = -normals[idx]
             norm_val = torch.norm(inward)
             if norm_val < 1e-8:
@@ -297,12 +296,13 @@ def compute_sdf_clipspace_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=1
             V_mat = look_at_torch(eye, target, device)  # (4, 4)
             PV = P @ V_mat  # (4, 4)
 
-            # Chuyển MỌI đỉnh sang Clip Space 1 phát
+            # Transform ALL vertices to Clip Space
             verts_clip4 = (PV @ verts_homo.T).T  # (N, 4)
             w_clip = verts_clip4[:, 3:4]
             w_safe = torch.where(torch.abs(w_clip) > 1e-8, w_clip,
                                  torch.ones_like(w_clip) * 1e-8)
-            # ★ Perspective Divide: Nón → Ống trụ song song
+            
+            # Perspective Divide: Transforms cone into parallel cylinder
             verts_ndc = verts_clip4[:, :3] / w_safe  # (N, 3)
 
             # Clip-Space triangle vertices
@@ -310,14 +310,14 @@ def compute_sdf_clipspace_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=1
             V1c = verts_ndc[faces[:, 1]]
             V2c = verts_ndc[faces[:, 2]]
 
-            # Lọc sơ bộ: Camera Space Z < 0 (phía trước camera)
+            # Visibility filtering: Z < 0 in Camera Space (ahead of camera)
             verts_cam = (V_mat @ verts_homo.T).T[:, :3]
             face_z = (verts_cam[faces[:, 0], 2] +
                       verts_cam[faces[:, 1], 2] +
                       verts_cam[faces[:, 2], 2]) / 3.0
             in_front = face_z < -0.005
 
-            # Umbrella: mặt chứa chính đỉnh gốc
+            # Exclude source faces (containing the vertex itself)
             is_umbrella = ((faces[:, 0] == idx) |
                            (faces[:, 1] == idx) |
                            (faces[:, 2] == idx))
@@ -335,7 +335,7 @@ def compute_sdf_clipspace_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=1
             V2w_f = V2w[vf_idx]
             umbrella_f = torch.zeros(len(vf_idx), dtype=torch.bool, device=device)
 
-            # ========== GIAI ĐOẠN 2: Möller-Trumbore GPU ==========
+            # PHASE 2: Batched GPU Möller-Trumbore
             hit_world, hit_valid = moller_trumbore_clip_batch(
                 ray_origins_clip, ray_dir,
                 V0c_f, V1c_f, V2c_f,
@@ -346,7 +346,7 @@ def compute_sdf_clipspace_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=1
             if hit_valid.sum() == 0:
                 continue
 
-            # Khoảng cách Euclid trong World Space
+            # Calculate exact Euclidean distance in World Space
             dists = torch.norm(hit_world - vertices[idx].unsqueeze(0), dim=-1)
             dists = torch.where(hit_valid, dists, torch.zeros_like(dists))
 
@@ -357,21 +357,21 @@ def compute_sdf_clipspace_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=1
     avg = sdf_values.mean().item()
 
     print(f"\n{'='*60}")
-    print(f"  THỜI GIAN: {elapsed:.4f} giây")
-    print(f"  SDF Trung bình: {avg:.4f}")
+    print(f"  ELAPSED TIME: {elapsed:.4f} seconds")
+    print(f"  Average SDF: {avg:.4f}")
     print(f"{'='*60}\n")
 
     return sdf_values.cpu().numpy()
 
 
 # =====================================================================
-# 5. MAIN
+# 5. ENTRY POINT
 # =====================================================================
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Clip-Space Möller-Trumbore SDF (GPU)")
+        description="Clip-Space Möller-Trumbore SDF (GPU Acceleration)")
     parser.add_argument("--input_file", type=str, default="data/radio_0026.off")
     parser.add_argument("--fov", type=int, default=120)
     parser.add_argument("--num_rings", type=int, default=5)
@@ -385,9 +385,9 @@ def main():
         mesh.fix_normals()
         mesh.process()
         if len(mesh.vertices) == 0:
-            raise ValueError("Mesh trống!")
+            raise ValueError("Mesh is empty!")
     except Exception as e:
-        print(f"Lỗi tải mesh: {e}")
+        print(f"Mesh loading error: {e}")
         return
 
     sdf = compute_sdf_clipspace_gpu(
@@ -399,7 +399,7 @@ def main():
         ray_batch_size=args.ray_batch
     )
 
-    # Visualization — MeshLab Style
+    # Visualization
     pv_mesh = pv.wrap(mesh)
     pv_mesh.point_data['ClipSpace_MT_SDF'] = sdf
 

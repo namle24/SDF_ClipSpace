@@ -1,0 +1,18 @@
+# Core Array & Tensor Library
+numpy>=1.24.0, <2.0.0
+
+# PyTorch Deep Learning & GPU Operations
+torch>=2.0.0
+
+# 3D Mesh Processing & Geometry
+trimesh>=4.0.0
+
+# Progress Tracking for Batch Operations
+tqdm>=4.66.0
+
+# Visiualization (Cho fast_sdf.py & sdf_calculator.py)
+pyvista>=0.40.0
+
+# (Tuỳ chọn) Cấu trúc cây tăng tốc độ bắn tia R-tree cho hàm Ray-Query 
+# Dành cho sdf_calculator.py bản CPU chạy siêu nhanh
+rtree>=1.1.0

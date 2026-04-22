@@ -205,7 +205,7 @@ def main():
         scalars='SDF_MeshLab_Exact',
         cmap='jet_r',
         smooth_shading=False,
-        show_edges=False,
+        show_edges=True,
         scalar_bar_args={'title': "Shape Diameter"}
     )
     plotter.set_background('white')

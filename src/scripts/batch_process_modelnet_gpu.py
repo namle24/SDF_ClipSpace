@@ -13,19 +13,19 @@ class ModelNetSDFProcessorGPU:
         self.output_dir = output_dir
         self.num_points = num_points
         self.num_rays = num_rays
-        self.batch_size = batch_size # Max 256 để chống tràn VRAM khi Face > 100k
+        self.batch_size = batch_size # Max 256 recommended to prevent VRAM overflow for faces > 100k
         
-        # Chọn Device ưu tiên GPU
+        # Priority on GPU device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"[*] Khởi tạo VO-SDF Processor. Thiết bị sử dụng: {self.device}")
+        print(f"[*] Initializing VO-SDF Processor. Device: {self.device}")
         
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
     def sample_points_on_mesh(self, mesh):
         """
-        Lấy mẫu ngẫu nhiên num_points điểm trên bề mặt mesh và nội suy pháp tuyến
-        Khâu này sử dụng CPU (trimesh) vì nó rất nhẹ so với phần Ray Rasterization.
+        Randomly samples num_points on the mesh surface and interpolates normals.
+        Executed on CPU as it is computationally light compared to Ray Rasterization.
         """
         points, face_indices = trimesh.sample.sample_surface(mesh, self.num_points)
         
@@ -40,13 +40,13 @@ class ModelNetSDFProcessorGPU:
         normals = normals / norms[:, None]
         return points, normals, face_indices
 
-    @torch.no_grad() # Tối ưu tối đa vì không cần tính gradient backprop
+    @torch.no_grad() # Optimized: no gradient backpropagation needed
     def compute_sdf(self, mesh, points, normals, face_indices):
         """
-        Tính toán SDF sử dụng VO-SDF PyTorch Tensor Cuda.
-        100% Vectorized GPU Rasterizer - Hiệu suất siêu tốc.
+        Computes SDF using VO-SDF via PyTorch CUDA Tensors.
+        100% Vectorized GPU Rasterizer for maximum performance.
         """
-        # --- Di chuyển Dữ liệu Input vào VRAM Device ---
+        # --- Upload Input Data to VRAM ---
         origins = torch.tensor(points, dtype=torch.float32, device=self.device)
         anti_normals = -torch.tensor(normals, dtype=torch.float32, device=self.device)
         
@@ -57,7 +57,7 @@ class ModelNetSDFProcessorGPU:
         N = len(origins)
         F = len(faces_tensor)
         
-        # --- 1. Dynamic Radius: 1% đường chéo Bounding Box ---
+        # --- 1. Dynamic Radius: 1% of Bounding Box diagonal ---
         bounds = torch.tensor(mesh.bounds, dtype=torch.float32, device=self.device)
         bbox_diag = torch.norm(bounds[1] - bounds[0])
         radius = 0.01 * bbox_diag
@@ -66,7 +66,7 @@ class ModelNetSDFProcessorGPU:
         face_vertices_world = mesh_vertices_tensor[faces_tensor]
         dist_matrix = torch.full((N, self.num_rays), float('nan'), device=self.device)
         
-        # --- 2. Sinh các tia song song trên Clip Space ---
+        # --- 2. Generate Parallel Rays in Clip Space ---
         r_rand = radius * torch.sqrt(torch.rand((N, self.num_rays), device=self.device))
         r_rand[:, 0] = 0.0 
         theta_rand = torch.rand((N, self.num_rays), device=self.device) * 2 * torch.pi
@@ -74,7 +74,7 @@ class ModelNetSDFProcessorGPU:
         ray_x = r_rand * torch.cos(theta_rand)
         ray_y = r_rand * torch.sin(theta_rand)
         
-        # --- 3. Xây dựng Camera Axis bằng Broadcasting Cross Product ---
+        # --- 3. Construct Camera Axis via Broadcasting Cross Product ---
         norms = torch.norm(anti_normals, dim=1, keepdim=True)
         norms[norms == 0] = 1.0
         z_cam = anti_normals / norms
@@ -91,8 +91,7 @@ class ModelNetSDFProcessorGPU:
         
         y_cam = torch.linalg.cross(z_cam, x_cam)
         
-        # --- 4. Hashing Batches trên GPU ---
-        # Tuỳ thuộc vào RAM GPU (VD: RTX 3090/A100), ta có thể đẩy batch size lên rất cao
+        # --- 4. Batched Processing on GPU ---
         for i in range(0, N, self.batch_size):
             end = min(i + self.batch_size, N)
             B = end - i
@@ -126,7 +125,7 @@ class ModelNetSDFProcessorGPU:
             px = ray_x[i:end].unsqueeze(2)
             py = ray_y[i:end].unsqueeze(2)
             
-            # --- 5. Point-in-Triangle (Edge Function 2D) ---
+            # --- 5. Point-in-Triangle (2D Edge Function) ---
             w0 = (v2_x - v1_x)*(py - v1_y) - (v2_y - v1_y)*(px - v1_x)
             w1 = (v0_x - v2_x)*(py - v2_y) - (v0_y - v2_y)*(px - v2_x)
             w2 = (v1_x - v0_x)*(py - v0_y) - (v1_y - v0_y)*(px - v0_x)
@@ -135,7 +134,7 @@ class ModelNetSDFProcessorGPU:
             has_pos = (w0 > 0) | (w1 > 0) | (w2 > 0)
             inside = ~(has_neg & has_pos)
             
-            # Lọc nhiễu cục bộ: Umbrella Filter
+            # Local Noise Filtering: Umbrella Filter
             b_face_indices = face_indices_tensor[i:end]
             is_umbrella = (torch.arange(F, device=self.device).unsqueeze(0) == b_face_indices.unsqueeze(1))
             is_umbrella = is_umbrella.unsqueeze(1) # B, 1, F
@@ -151,8 +150,7 @@ class ModelNetSDFProcessorGPU:
             min_Z, _ = torch.min(Z_hit, dim=2)
             dist_matrix[i:end, :] = torch.where(torch.isinf(min_Z), torch.tensor(float('nan'), device=self.device), min_Z)
             
-        # --- 7. Statistical IQR Outlier Removal ---
-        # --- 7. Statistical IQR Outlier Removal Pytorch GPU ---
+        # --- 7. Statistical Outlier Removal (IQR) on GPU ---
         q1 = torch.nanquantile(dist_matrix, 0.25, dim=1)
         q3 = torch.nanquantile(dist_matrix, 0.75, dim=1)
         iqr = q3 - q1
@@ -184,12 +182,12 @@ class ModelNetSDFProcessorGPU:
         try:
             mesh = trimesh.load(file_path, force='mesh')
             if len(mesh.vertices) == 0 or len(mesh.faces) == 0:
-                print(f"[Cảnh báo] MESH rỗng hoặc lỗi cấu trúc: {file_path}")
+                print(f"[Warning] Empty or malformed mesh: {file_path}")
                 return False
                 
             points, normals, face_indices = self.sample_points_on_mesh(mesh)
             
-            # Tính toán SDF trên Pytorch GPU
+            # Compute SDF on GPU
             sdf_values = self.compute_sdf(mesh, points, normals, face_indices)
             
             output_data = np.hstack((points, sdf_values[:, None]))
@@ -198,11 +196,11 @@ class ModelNetSDFProcessorGPU:
             return True
             
         except Exception as e:
-            print(f"[Cảnh báo] Ngoại lệ khi xử lý file {file_path}: {e}")
+            print(f"[Warning] Exception processing file {file_path}: {e}")
             return False
 
     def run(self):
-        print(f"Bắt đầu quét thư mục {self.input_dir}...")
+        print(f"Scanning directory {self.input_dir}...")
         
         search_pattern_off = os.path.join(self.input_dir, '**', '*.off')
         search_pattern_obj = os.path.join(self.input_dir, '**', '*.obj')
@@ -210,10 +208,10 @@ class ModelNetSDFProcessorGPU:
         files = glob.glob(search_pattern_off, recursive=True) + glob.glob(search_pattern_obj, recursive=True)
         
         if len(files) == 0:
-            print("Không tìm thấy file .off hoặc .obj nào trong thư mục đầu vào!")
+            print("No .off or .obj files found in input directory!")
             return
             
-        print(f"Tổng số file cần xử lý: {len(files)}")
+        print(f"Total files to process: {len(files)}")
         
         success_count = 0
         error_count = 0
@@ -233,21 +231,20 @@ class ModelNetSDFProcessorGPU:
             else:
                 error_count += 1
                 
-        print("\n--- TỔNG KẾT ---")
-        print(f"Số file bỏ qua (đã có kết quả): {skip_count}")
-        print(f"Số file xử lý thành công     : {success_count}")
-        print(f"Số file gặp lỗi              : {error_count}")
-        print(f"Tổng                        : {len(files)}")
+        print("\n--- SUMMARY ---")
+        print(f"Skipped files (already exists): {skip_count}")
+        print(f"Successfully processed files  : {success_count}")
+        print(f"Failed files                  : {error_count}")
+        print(f"Total files                   : {len(files)}")
 
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="GPU-Accelerated ModelNet40 VO-SDF Data Preprocessing")
-    parser.add_argument("--input_dir", type=str, default="ModelNet40", help="Đường dẫn đến thư mục root của ModelNet40")
-    parser.add_argument("--output_dir", type=str, default="ModelNet40_SDF_1024", help="Thư mục xuất file .npy")
-    parser.add_argument("--num_points", type=int, default=1024, help="Số điểm lấy mẫu")
-    parser.add_argument("--num_rays", type=int, default=30, help="Số lượng tia bắn cho mỗi điểm")
-    # Tăng Default batch_size lên 256 để chống tràn VRAM
-    parser.add_argument("--batch_size", type=int, default=256, help="Kích thước batch Vectorization cho GPU")
+    parser.add_argument("--input_dir", type=str, default="ModelNet40", help="Path to ModelNet40 root directory")
+    parser.add_argument("--output_dir", type=str, default="ModelNet40_SDF_1024", help="Output directory for .npy files")
+    parser.add_argument("--num_points", type=int, default=1024, help="Number of sampled points")
+    parser.add_argument("--num_rays", type=int, default=30, help="Number of rays per point")
+    parser.add_argument("--batch_size", type=int, default=256, help="GPU vectorization batch size")
     
     args = parser.parse_args()
     

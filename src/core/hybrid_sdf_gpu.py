@@ -1,22 +1,22 @@
 """
-hybrid_sdf_gpu.py — Hybrid View-Projection SDF trên GPU
+hybrid_sdf_gpu.py — Hybrid View-Projection SDF on GPU
 
-Kết hợp:
-  - Tư duy toán học của Giáo sư: look_at + perspective → Clip Space
-    (chùm tia nón phối cảnh được "nắn thẳng" thành chùm tia song song dọc trục Z)
-  - Sức mạnh GPU PyTorch: Toàn bộ phép biến đổi, lọc Bounding-Box 2D,
-    Point-in-Triangle 2D, Z-Buffer Interpolation đều chạy trên Tensor CUDA.
+Features:
+  - Theoretical framework: look_at + perspective → Clip Space
+    (Perspective cone rays are "straightened" into parallel rays along the Z-axis)
+  - GPU acceleration via PyTorch: Transformations, 2D Bounding-Box filtering,
+    Vectorized 2D Point-in-Triangle testing, and Barycentric Z-Buffer interpolation.
 
-Ý tưởng cốt lõi (trích dẫn cho Paper):
-  1. Với mỗi đỉnh (hoặc face center), tạo ma trận View V = look_at(eye, target)
-     và ma trận Projection P = perspective(fov, near, far).
-  2. Nhân PV @ vertices_homo.T  →  chuyển MỌI đỉnh sang Clip Space cùng lúc.
-  3. Sau Perspective Divide (xyz /= w), chùm tia hình nón trong World Space
-     biến thành chùm tia SONG SONG dọc trục Z trong Clip Space.
-  4. Sinh lưới tia đều trên mặt phẳng XY (vòng tròn đồng tâm) trong Clip Space.
-  5. Dùng Bounding-Box 2D + Point-in-Triangle 2D Vectorized để tìm mặt bị đâm.
-  6. Nội suy Z bằng Barycentric → tìm điểm chạm gần nhất.
-  7. Tính khoảng cách Euclid trong World Space → SDF.
+Core Methodology:
+  1. For each vertex (or face center), construct View matrix V = look_at(eye, target)
+     and Projection matrix P = perspective(fov, near, far).
+  2. Perform PV @ vertices_homo.T to transform all vertices to Clip Space simultaneously.
+  3. After Perspective Divide (xyz /= w), the perspective cone in World Space
+     becomes a PARALLEL ray bundle along the Z-axis in Clip Space.
+  4. Generate a regular grid of rays on the XY plane (concentric rings) in Clip Space.
+  5. Use Vectorized 2D Bounding-Box and Point-in-Triangle tests to identify intersected faces.
+  6. Perform Barycentric interpolation for Z-depth to find the closest hit point.
+  7. Compute exact Euclidean distance in World Space to obtain SDF values.
 """
 
 import trimesh
@@ -27,17 +27,17 @@ import torch
 from tqdm import tqdm
 
 
-# 1. CAMERA MATRICES — Dịch nguyên bản Toán học Giáo sư sang PyTorch
+# 1. CAMERA MATRICES — Mathematical implementation in PyTorch
 
 def look_at_torch(eye, target, device='cuda'):
     """
-    Xây dựng ma trận View 4×4 (World → Camera) trên GPU.
-    Giữ nguyên logic Gram–Schmidt: forward → random up → right → true_up.
+    Constructs a 4×4 View Matrix (World → Camera) on GPU.
+    Implements Gram–Schmidt orthogonalization: forward → random up → right → true_up.
     """
     forward = target - eye
     forward = forward / (torch.norm(forward) + 1e-12)
 
-    # Sinh vector up ngẫu nhiên rồi chiếu vuông góc với forward (Gram–Schmidt)
+    # Generate random up vector and project it onto the plane perpendicular to forward
     up = torch.randn(3, device=device, dtype=torch.float32)
     up = up - torch.dot(up, forward) * forward  # Gram-Schmidt
     up = up / (torch.norm(up) + 1e-12)
@@ -64,7 +64,7 @@ def look_at_torch(eye, target, device='cuda'):
 
 def perspective_torch(fov, near, far, device='cuda'):
     """
-    Ma trận Projection 4×4 (Camera → Clip) trên GPU.
+    4x4 Projection Matrix (Camera → Clip Space) on GPU.
     """
     cot = 1.0 / torch.tan(fov / 2)
     P = torch.zeros((4, 4), dtype=torch.float32, device=device)
@@ -76,12 +76,12 @@ def perspective_torch(fov, near, far, device='cuda'):
     return P
 
 
-# 2. SINH LƯỚI TIA VÒNG TRÒN ĐỒNG TÂM — Giữ nguyên logic Ring của Thầy
+# 2. CONCENTRIC RING RAY GENERATION
 
 def generate_ring_rays_torch(fov, num_rings=5, num_rays_per_ring=10, device='cuda'):
     """
-    Sinh chùm tia dạng vòng tròn đồng tâm bên trong Clip Space.
-    Giữ nguyên logic ring/angle nhưng output là Tensor.
+    Generates a bundle of rays in a concentric ring pattern within Clip Space.
+    Returns a Tensor of XY coordinates.
     """
     tan_fov = torch.tan(fov / 2)
     all_xy = []
@@ -95,58 +95,58 @@ def generate_ring_rays_torch(fov, num_rings=5, num_rays_per_ring=10, device='cud
     return torch.cat(all_xy, dim=0)  # (R, 2)
 
 
-# 3. ENGINE CHÍNH — Hybrid View-Projection + GPU Vectorized Rasterizer
+# 3. CORE ENGINE — Hybrid View-Projection + GPU Vectorized Rasterizer
 @torch.no_grad()
 def compute_hybrid_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
                            vertex_batch_size=64):
     """
-    Tính SDF trên từng đỉnh bằng phương pháp Hybrid:
-      - View-Projection camera (Giáo sư)
-      - Point-in-Triangle 2D + Z-Buffer trên GPU (Pipeline chúng ta)
+    Calculates SDF for each vertex using a Hybrid approach:
+      - View-Projection camera model
+      - GPU-accelerated 2D Point-in-Triangle testing + Z-Buffer interpolation
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"\n[BẮT ĐẦU HYBRID VIEW-PROJECTION SDF]")
-    print(f"Thiết bị xử lý lõi: {device}")
+    print(f"\n[STARTING HYBRID VIEW-PROJECTION SDF]")
+    print(f"Computational device: {device}")
 
     start_time = time.perf_counter()
 
-    # --- Tải dữ liệu lên VRAM ---
+    # --- Data upload to VRAM ---
     vertices = torch.tensor(mesh.vertices, dtype=torch.float32, device=device)  # (V, 3)
     normals = torch.tensor(mesh.vertex_normals, dtype=torch.float32, device=device)
     faces = torch.tensor(mesh.faces, dtype=torch.long, device=device)  # (F, 3)
 
     V_count = len(vertices)
     F_count = len(faces)
-    print(f"[*] Mesh: {V_count} đỉnh, {F_count} tam giác → vRAM.")
+    print(f"[*] Mesh: {V_count} vertices, {F_count} triangles uploaded to vRAM.")
 
-    # Homogeneous coordinates cho toàn bộ đỉnh (tính 1 lần duy nhất)
+    # Pre-calculate Homogeneous coordinates
     ones = torch.ones((V_count, 1), dtype=torch.float32, device=device)
     verts_homo = torch.cat([vertices, ones], dim=-1)  # (V, 4)
 
-    # Tham số camera
+    # Camera parameters
     fov = torch.tensor(np.radians(fov_deg), dtype=torch.float32, device=device)
     near = torch.tensor(0.001, dtype=torch.float32, device=device)
-    # far tự động = Đường chéo BBox + 1
+    # far automatically set based on Bounding Box diagonal
     bbox_diag = torch.norm(vertices.max(dim=0).values - vertices.min(dim=0).values)
     far = bbox_diag + 1.0
 
-    # Sinh lưới tia 1 lần (dùng lại cho mọi đỉnh)
+    # Pre-generate ray bundle
     ray_xy = generate_ring_rays_torch(fov, num_rings, num_rays_per_ring, device)  # (R, 2)
     R = len(ray_xy)
-    print(f"[*] Số tia / đỉnh: {R}  |  FOV: {fov_deg}°  |  Near/Far: {near.item():.3f}/{far.item():.1f}")
+    print(f"[*] Rays/Vertex: {R}  |  FOV: {fov_deg}°  |  Near/Far: {near.item():.3f}/{far.item():.1f}")
 
-    # Ma trận Projection (chung cho tất cả — chỉ View thay đổi theo đỉnh)
+    # Projection matrix (static across all vertices)
     P = perspective_torch(fov, near, far, device)  # (4, 4)
 
     sdf_values = torch.zeros(V_count, dtype=torch.float32, device=device)
 
-    # --- Xử lý theo từng Batch đỉnh ---
+    # --- Process via Vertex Batches ---
     for b_start in tqdm(range(0, V_count, vertex_batch_size),
-                        desc="Hybrid VP-SDF Batches"):
+                        desc="Hybrid VP-SDF Processing"):
         b_end = min(b_start + vertex_batch_size, V_count)
 
         for idx in range(b_start, b_end):
-            # ===== BƯỚC A: Xây Camera cho đỉnh này (giống Thầy) =====
+            # STEP A: Construct camera for the current vertex
             inward = -normals[idx]
             norm_val = torch.norm(inward)
             if norm_val < 1e-8:
@@ -158,33 +158,33 @@ def compute_hybrid_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
             V_mat = look_at_torch(eye, target, device)  # (4, 4)
             PV = P @ V_mat  # (4, 4)
 
-            # ===== BƯỚC B: Chuyển MỌI đỉnh sang Clip Space 1 phát =====
+            # STEP B: Transform ALL vertices to Clip Space
             verts_clip = (PV @ verts_homo.T).T  # (V, 4)
             w_clip = verts_clip[:, 3:4]
-            # Perspective Divide  —  Chùm nón nắn thành chùm song song
+            # Perspective Divide: Transform cone to parallel bundle
             w_safe = torch.where(torch.abs(w_clip) > 1e-8, w_clip,
                                  torch.tensor(1e-8, device=device))
             verts_ndc = verts_clip[:, :3] / w_safe  # (V, 3)
 
-            # ===== BƯỚC C: Lấy tọa độ tam giác trong NDC =====
+            # STEP C: Obtain triangle coordinates in NDC space
             tri_v0 = verts_ndc[faces[:, 0]]  # (F, 3)
             tri_v1 = verts_ndc[faces[:, 1]]
             tri_v2 = verts_ndc[faces[:, 2]]
 
-            # Bounding Box 2D cho mỗi tam giác ♦ Vectorized
+            # Vectorized 2D Bounding Box calculation
             tri_min_x = torch.minimum(torch.minimum(tri_v0[:, 0], tri_v1[:, 0]), tri_v2[:, 0])
             tri_max_x = torch.maximum(torch.maximum(tri_v0[:, 0], tri_v1[:, 0]), tri_v2[:, 0])
             tri_min_y = torch.minimum(torch.minimum(tri_v0[:, 1], tri_v1[:, 1]), tri_v2[:, 1])
             tri_max_y = torch.maximum(torch.maximum(tri_v0[:, 1], tri_v1[:, 1]), tri_v2[:, 1])
 
-            # Lọc mặt nằm phía trước Camera (z < 0 trong Camera Space)
+            # Filter faces behind the camera (Camera Space Z < 0)
             verts_cam = (V_mat @ verts_homo.T).T[:, :3]
             face_center_z = (verts_cam[faces[:, 0], 2] +
                              verts_cam[faces[:, 1], 2] +
                              verts_cam[faces[:, 2], 2]) / 3.0
             in_front = face_center_z < -0.005  # (F,) bool
 
-            # Lọc Umbrella (mặt chứa chính đỉnh gốc)
+            # Exclude source faces (containing the vertex itself)
             is_umbrella = ((faces[:, 0] == idx) |
                            (faces[:, 1] == idx) |
                            (faces[:, 2] == idx))
@@ -193,8 +193,8 @@ def compute_hybrid_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
             if valid_face_mask.sum() == 0:
                 continue
 
-            # Chỉ giữ lại mặt hợp lệ
-            vf_idx = torch.where(valid_face_mask)[0]  # indices
+            # Keep only valid faces
+            vf_idx = torch.where(valid_face_mask)[0]
             vf_v0 = tri_v0[vf_idx]  # (Fv, 3)
             vf_v1 = tri_v1[vf_idx]
             vf_v2 = tri_v2[vf_idx]
@@ -204,8 +204,7 @@ def compute_hybrid_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
             vf_max_y = tri_max_y[vf_idx]
             Fv = len(vf_idx)
 
-            # ===== BƯỚC D: Bắn tia song song trong Clip Space =====
-            # ray_xy shape (R, 2).  Broadcast so sánh BBox: (R, Fv)
+            # STEP D: Parallel raycasting in Clip Space
             px = ray_xy[:, 0].unsqueeze(1)  # (R, 1)
             py = ray_xy[:, 1].unsqueeze(1)
 
@@ -214,8 +213,7 @@ def compute_hybrid_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
                        (py >= vf_min_y.unsqueeze(0)) &
                        (py <= vf_max_y.unsqueeze(0)))  # (R, Fv)
 
-            # ===== BƯỚC E: Point-in-Triangle 2D (Edge Function) =====
-            # Chỉ chạy trên các cặp (ray, face) qua BBox
+            # STEP E: 2D Point-in-Triangle test (Edge Function)
             v0x = vf_v0[:, 0].unsqueeze(0)  # (1, Fv)
             v0y = vf_v0[:, 1].unsqueeze(0)
             v1x = vf_v1[:, 0].unsqueeze(0)
@@ -233,7 +231,7 @@ def compute_hybrid_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
 
             hit_mask = in_bbox & inside  # (R, Fv)
 
-            # ===== BƯỚC F: Z-Buffer Interpolation (Barycentric) =====
+            # STEP F: Z-Buffer Interpolation (Barycentric coordinates)
             v0z = vf_v0[:, 2].unsqueeze(0)  # (1, Fv)
             v1z = vf_v1[:, 2].unsqueeze(0)
             v2z = vf_v2[:, 2].unsqueeze(0)
@@ -241,28 +239,27 @@ def compute_hybrid_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
             Area = (v1x - v0x) * (v2y - v0y) - (v1y - v0y) * (v2x - v0x)
             Z_hit = (w0 * v0z + w1 * v1z + w2 * v2z) / (Area + 1e-12)  # (R, Fv)
 
-            # Validate: Nằm trong tam giác, Area hợp lệ, Z > 0 (phía trước)
+            # Validate: Inside triangle, valid Area, and depth within (0, 1)
             valid = hit_mask & (torch.abs(Area) > 1e-12) & (Z_hit > 0) & (Z_hit < 1)
             Z_hit = torch.where(valid, Z_hit, torch.tensor(float('inf'), device=device))
 
-            # Tìm mặt gần nhất cho từng tia
+            # Find nearest hit for each ray
             min_Z, min_idx = torch.min(Z_hit, dim=1)  # (R,)
 
-            # ===== BƯỚC G: Tính khoảng cách World Space =====
-            # Lấy face index thực tế trong mảng gốc
+            # STEP G: Compute World Space Euclidean Distance
             hit_face_global = vf_idx[min_idx]  # (R,)
             hit_valid = min_Z < float('inf')
 
             if hit_valid.sum() == 0:
                 continue
 
-            # Tâm của face bị đâm trúng (trong World Space)
+            # Hit face centroids in World Space
             hit_faces_v0 = vertices[faces[hit_face_global, 0]]
             hit_faces_v1 = vertices[faces[hit_face_global, 1]]
             hit_faces_v2 = vertices[faces[hit_face_global, 2]]
             hit_centers = (hit_faces_v0 + hit_faces_v1 + hit_faces_v2) / 3.0
 
-            # Khoảng cách Euclid từ đỉnh gốc → Tâm mặt bị đâm
+            # Euclidean distance from source vertex to hit centroid
             dists = torch.norm(hit_centers - vertices[idx].unsqueeze(0), dim=1)
             dists = torch.where(hit_valid, dists, torch.tensor(0.0, device=device))
 
@@ -275,8 +272,8 @@ def compute_hybrid_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
 
     avg_sdf = sdf_values.mean().item()
     print(f"\n=======================================================")
-    print(f"[*] THỜI GIAN TÍNH TOÁN HYBRID VP-SDF (GPU): {elapsed:.4f} giây")
-    print(f"[*] SDF Trung bình: {avg_sdf:.4f}")
+    print(f"[*] HYBRID VP-SDF GPU COMPILATION TIME: {elapsed:.4f} seconds")
+    print(f"[*] Average SDF: {avg_sdf:.4f}")
     print(f"=======================================================\n")
 
     return sdf_values.cpu().numpy()
@@ -285,15 +282,15 @@ def compute_hybrid_sdf_gpu(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
 def main():
     import argparse
     parser = argparse.ArgumentParser(
-        description="Hybrid View-Projection SDF GPU (Giáo sư + PyTorch)")
+        description="Hybrid View-Projection SDF GPU Implementation")
     parser.add_argument("--input_file", type=str, default="data/radio_0026.off",
-                        help="Đường dẫn model 3D")
-    parser.add_argument("--fov", type=int, default=90, help="Góc FOV (độ)")
-    parser.add_argument("--num_rings", type=int, default=5, help="Số vòng tia")
+                        help="Path to 3D model")
+    parser.add_argument("--fov", type=int, default=90, help="FOV angle (degrees)")
+    parser.add_argument("--num_rings", type=int, default=5, help="Number of concentric rings")
     parser.add_argument("--rays_per_ring", type=int, default=10,
-                        help="Số tia / vòng (vòng ngoài nhân bội)")
+                        help="Base rays per ring")
     parser.add_argument("--batch_size", type=int, default=64,
-                        help="Batch đỉnh xử lý song song")
+                        help="Vertex batch size for parallel processing")
     args = parser.parse_args()
 
     try:
@@ -301,9 +298,9 @@ def main():
         mesh.fix_normals()
         mesh.process()
         if len(mesh.vertices) == 0:
-            raise ValueError("Mesh trống!")
+            raise ValueError("Mesh is empty!")
     except Exception as e:
-        print(f"Lỗi tải mesh: {e}")
+        print(f"Mesh loading error: {e}")
         return
 
     sdf = compute_hybrid_sdf_gpu(
@@ -314,11 +311,11 @@ def main():
         vertex_batch_size=args.batch_size
     )
 
-    # Visualization — MeshLab Style
+    # Visualization
     pv_mesh = pv.wrap(mesh)
     pv_mesh.point_data['Hybrid_VP_SDF'] = sdf
 
-    plotter = pv.Plotter(title="Hybrid View-Projection SDF (GPU) — MeshLab Style")
+    plotter = pv.Plotter(title="Hybrid View-Projection SDF (GPU)")
     plotter.add_mesh(
         pv_mesh,
         scalars='Hybrid_VP_SDF',

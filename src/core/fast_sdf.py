@@ -247,7 +247,7 @@ def main(args):
             print(f"Face {face_id}: have no intersection")
     
     end_time = time.time()
-    print(f"\n--- Thoi gian tinh toan: {end_time - start_time:.2f} giay ---")
+    print(f"\n--- Computation time: {end_time - start_time:.2f} seconds ---")
 
     # Write SDF values to a text file
     import os
@@ -271,6 +271,6 @@ def main(args):
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Spherical SOM surface segmentation.")
-    parser.add_argument("--obj_file", type=str, required=False, default=r"D:\CMSVTransformer\data\radio_0026.off", help="Path to the OBJ file")
+    parser.add_argument("--obj_file", type=str, required=False, default=r"D:\CMSVTransformer\data\lamp_0021.off", help="Path to the OBJ file")
     args = parser.parse_args()
     main(args)

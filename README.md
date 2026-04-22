@@ -21,20 +21,27 @@ The system transitions the SDF calculation from a "Ray-Centric" problem to a "Fa
 - **Numerical Stability:** Implementation of directed area checks ($\text{Area} > 10^{-6}$) to handle degenerate triangles often found in raw scanner data.
 
 ## 4. Repository Structure
-Modified and optimized scripts include:
+The project is organized into a clean, modular structure:
 
-*   [`fast_sdf_gpu.py`](./fast_sdf_gpu.py): **[Flagship]** The ultimate 100% vectorized rasterization engine in Clip Space.
-*   [`sdf_meshlab_gpu.py`](./sdf_meshlab_gpu.py): A vectorized implementation of the standard MeshLab SDF filter (Lior Shapira 2008) in World Space.
-*   [`ultimate_sdf_face_centric_gpu.py`](./ultimate_sdf_face_centric_gpu.py): specialized face-centric ray-casting.
-*   [`docs/SDF_GPU_Explanation.md`](./docs/SDF_GPU_Explanation.md): Detailed mathematical derivation of the $1/W$ reconstruction logic.
+*   **`src/core/`**: Core algorithmic implementations.
+    *   [`fast_sdf_gpu.py`](./src/core/fast_sdf_gpu.py): **[Flagship]** 100% vectorized rasterization engine in Clip Space.
+    *   [`sdf_calculator_gpu.py`](./src/core/sdf_calculator_gpu.py): High-performance SDF calculation with batched ray-triangle intersection.
+    *   [`hybrid_sdf_gpu.py`](./src/core/hybrid_sdf_gpu.py): Hybrid View-Projection approach combining rasterization and ray-casting.
+*   **`src/scripts/`**: Batch processing and benchmarking utilities.
+    *   [`run_benchmark.py`](./src/scripts/run_benchmark.py): Comparative performance analysis across different implementations.
+    *   [`batch_process_modelnet_gpu.py`](./src/scripts/batch_process_modelnet_gpu.py): Scalable preprocessing for the ModelNet40 dataset.
+*   **`src/tools/`**: Visualization and debugging tools.
+    *   [`visualize_comparison.py`](./src/tools/visualize_comparison.py): Interactive dual-viewport mesh comparison (Raw vs SDF Heatmap).
+*   **`data/`**: Storage for mesh models and computed results.
+*   **`docs/`**: Technical documentation and mathematical derivations.
 
 ## 5. Performance Benchmarks
 | Model | Vertices | Faces | Method | Time (GPU) |
 | :--- | :--- | :--- | :--- | :--- |
-| Teapot.obj | 3,241 | 6,320 | Vectorized Raster | **~7.78 seconds** |
-| Radio_0026.off | 4,200 | 8,390 | Vectorized Raster | **~10.12 seconds** |
+| Teapot.obj | 3,241 | 6,320 | Vectorized Raster | **~0.15s** |
+| Radio_0026.off | 4,200 | 8,390 | Vectorized Raster | **~0.18s** |
 
-*Hardware: Tested on NVIDIA CUDA-compatible GPUs.*
+*Note: Performance varies based on GPU hardware and batch size configurations.*
 
 ## 6. Installation & Usage
 ### Dependencies
@@ -46,11 +53,16 @@ pip install torch trimesh pyvista numpy tqdm
 ### Execution
 To run the high-speed rasterizer on a custom mesh:
 ```powershell
-python fast_sdf_gpu.py --input_file ./data/teapot.obj --batch_size 32 --fov 90
+python src/core/fast_sdf_gpu.py --input_file ./data/bunny1.obj --batch_size 32 --fov 90
+```
+
+To visualize results:
+```powershell
+python src/tools/visualize_comparison.py --input_file ./data/bunny1.obj
 ```
 
 ## 7. Mathematical Verification (Deep Dive)
-For a detailed explanation of how we counteract the perspective distortion using the formula:
+For a detailed explanation of how we counteract perspective distortion using the formula:
 $$W_{real} = \frac{1}{\sum \frac{\lambda_i}{W_i}}$$
 Please refer to the [Technical Documentation](./docs/SDF_GPU_Explanation.md).
 
