@@ -188,22 +188,16 @@ def compute_sdf_gpu_v4(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
         # Static mask: valid W + non-degenerate area
         static_mask = valid_w & valid_area                         # (B, F)
 
-        # Precompute edge vectors for barycentric (ONCE per batch)
-        e_v2v1_x = V2x - V1x                                      # (B, F)
-        e_v2v1_y = V2y - V1y
-        e_v0v2_x = V0x - V2x
-        e_v0v2_y = V0y - V2y
-        e_v1v0_x = V1x - V0x
-        e_v1v0_y = V1y - V0y
 
         # NDC Z per vertex
         Z0 = V0_ndc[..., 2]                                       # (B, F)
         Z1 = V1_ndc[..., 2]
         Z2 = V2_ndc[..., 2]
 
-        # Pre-allocate accumulators
+        # ── Pre-allocate accumulators ──────────────────────────────────────
         dist_sum = torch.zeros(B, dtype=torch.float32, device=device)
         hit_cnt  = torch.zeros(B, dtype=torch.float32, device=device)
+        INF = torch.tensor(1e6, device=device)
 
         # ── Inner loop: ray chunking ──────────────────────────────────────
         for r_start in range(0, R, ray_chunk_size):
@@ -213,178 +207,122 @@ def compute_sdf_gpu_v4(mesh, fov_deg=90, num_rings=5, num_rays_per_ring=10,
             px_sub = px_rays[r_start:r_end]                        # (Rc,)
             py_sub = py_rays[r_start:r_end]
 
-            # ── Stage 2: TILE CULLING (before barycentric) ────────────────
-            # [FIX 2] Cull faces BEFORE computing barycentric → O(R×k)
+            # ── TILE LOOKUP (per ray) ─────────────────────────────────────
             rt_x = ((px_sub + 1.0) * half_gs).long().clamp(0, gs - 1)  # (Rc,)
             rt_y = ((py_sub + 1.0) * half_gs).long().clamp(0, gs - 1)
 
-            # Batch-conservative tile ranges: union across B cameras
-            ft_xmin_con = ft_xmin.min(dim=0).values                # (F,)
-            ft_xmax_con = ft_xmax.max(dim=0).values
-            ft_ymin_con = ft_ymin.min(dim=0).values
-            ft_ymax_con = ft_ymax.max(dim=0).values
-            static_any  = static_mask.any(dim=0)                   # (F,)
+            # Build tile overlap mask: (B, Rc, F)
+            in_tile = (
+                (rt_x.view(1, Rc, 1) >= ft_xmin.unsqueeze(1)) &
+                (rt_x.view(1, Rc, 1) <= ft_xmax.unsqueeze(1)) &
+                (rt_y.view(1, Rc, 1) >= ft_ymin.unsqueeze(1)) &
+                (rt_y.view(1, Rc, 1) <= ft_ymax.unsqueeze(1)) &
+                static_mask.unsqueeze(1)
+            )  # (B, Rc, F)
 
-            # For each ray, find faces whose tile range contains that ray's tile
-            # rt_x: (Rc,) → (Rc, 1) vs ft ranges: (F,) → (1, F)
-            ray_face_hit = (
-                (rt_x.unsqueeze(1) >= ft_xmin_con.unsqueeze(0)) &
-                (rt_x.unsqueeze(1) <= ft_xmax_con.unsqueeze(0)) &
-                (rt_y.unsqueeze(1) >= ft_ymin_con.unsqueeze(0)) &
-                (rt_y.unsqueeze(1) <= ft_ymax_con.unsqueeze(0)) &
-                static_any.unsqueeze(0)
-            )  # (Rc, F)
+            # ── Per-chunk accumulators ────────────────────────────────────
+            sdf_chunk   = torch.zeros((B, Rc), device=device)
+            valid_chunk = torch.zeros((B, Rc), device=device)
 
-            # Candidate face indices: faces that pass tile test for ANY ray
-            cand_mask = ray_face_hit.any(dim=0)                    # (F,)
-            cand_idx  = cand_mask.nonzero(as_tuple=True)[0]        # (k,)
-            k = len(cand_idx)
+            # ── PER-RAY LOOP: true O(R·k) via sparse candidate selection ─
+            for r in range(Rc):
 
-            if k == 0:
-                continue
+                mask_r = in_tile[:, r, :]                          # (B, F)
 
-            # ── Gather only candidate face data (F → k) ──────────────────
-            c_V0x = V0x[:, cand_idx]                               # (B, k)
-            c_V0y = V0y[:, cand_idx]
-            c_V1x = V1x[:, cand_idx]
-            c_V1y = V1y[:, cand_idx]
-            c_V2x = V2x[:, cand_idx]
-            c_V2y = V2y[:, cand_idx]
+                if not mask_r.any():
+                    continue
 
-            c_e_v2v1_x = e_v2v1_x[:, cand_idx]                    # (B, k)
-            c_e_v2v1_y = e_v2v1_y[:, cand_idx]
-            c_e_v0v2_x = e_v0v2_x[:, cand_idx]
-            c_e_v0v2_y = e_v0v2_y[:, cand_idx]
-            c_e_v1v0_x = e_v1v0_x[:, cand_idx]
-            c_e_v1v0_y = e_v1v0_y[:, cand_idx]
+                # Select candidate (camera, face) pairs
+                idx   = mask_r.nonzero(as_tuple=False)             # (N, 2)
+                b_idx = idx[:, 0]                                  # (N,)
+                f_idx = idx[:, 1]                                  # (N,)
 
-            c_area       = area[:, cand_idx]                       # (B, k)
-            c_static     = static_mask[:, cand_idx]                # (B, k)
-            c_Z0         = Z0[:, cand_idx]                         # (B, k)
-            c_Z1         = Z1[:, cand_idx]
-            c_Z2         = Z2[:, cand_idx]
-            c_W0         = W0[:, cand_idx]                         # (B, k)
-            c_W1         = W1[:, cand_idx]
-            c_W2         = W2[:, cand_idx]
+                # Gather NDC vertices for candidate faces
+                c0x = V0x[b_idx, f_idx]                            # (N,)
+                c0y = V0y[b_idx, f_idx]
+                c0z = Z0[b_idx, f_idx]
+                c1x = V1x[b_idx, f_idx]
+                c1y = V1y[b_idx, f_idx]
+                c1z = Z1[b_idx, f_idx]
+                c2x = V2x[b_idx, f_idx]
+                c2y = V2y[b_idx, f_idx]
+                c2z = Z2[b_idx, f_idx]
 
-            # ── Stage 3: BARYCENTRIC (on candidates only) ─────────────────
-            # Scalar broadcast: (1,Rc,1) vs (B,1,k) → (B,Rc,k)
-            px = px_sub.view(1, Rc, 1)                             # (1, Rc, 1)
-            py = py_sub.view(1, Rc, 1)
+                # Ray point (scalar, same for all candidates at this ray)
+                px_r = px_sub[r]
+                py_r = py_sub[r]
 
-            # Per-camera tile test on candidates
-            c_ft_xmin = ft_xmin[:, cand_idx]                       # (B, k)
-            c_ft_xmax = ft_xmax[:, cand_idx]
-            c_ft_ymin = ft_ymin[:, cand_idx]
-            c_ft_ymax = ft_ymax[:, cand_idx]
+                # ── BARYCENTRIC (only k candidate faces) ──────────────────
+                denom = (
+                    (c1y - c2y) * (c0x - c2x) +
+                    (c2x - c1x) * (c0y - c2y)
+                ) + 1e-8
 
-            tile_hit = (
-                (rt_x.view(1, Rc, 1) >= c_ft_xmin.unsqueeze(1)) &
-                (rt_x.view(1, Rc, 1) <= c_ft_xmax.unsqueeze(1)) &
-                (rt_y.view(1, Rc, 1) >= c_ft_ymin.unsqueeze(1)) &
-                (rt_y.view(1, Rc, 1) <= c_ft_ymax.unsqueeze(1)) &
-                c_static.unsqueeze(1)
-            )  # (B, Rc, k)
+                u_val = (
+                    (c1y - c2y) * (px_r - c2x) +
+                    (c2x - c1x) * (py_r - c2y)
+                ) / denom
 
-            # w0 = cross2d(V2-V1, P-V1)
-            dp1_x = px - c_V1x.unsqueeze(1)                       # (B, Rc, k)
-            dp1_y = py - c_V1y.unsqueeze(1)
-            w0 = c_e_v2v1_x.unsqueeze(1) * dp1_y - c_e_v2v1_y.unsqueeze(1) * dp1_x
+                v_val = (
+                    (c2y - c0y) * (px_r - c2x) +
+                    (c0x - c2x) * (py_r - c2y)
+                ) / denom
 
-            # w1 = cross2d(V0-V2, P-V2)
-            dp2_x = px - c_V2x.unsqueeze(1)
-            dp2_y = py - c_V2y.unsqueeze(1)
-            w1 = c_e_v0v2_x.unsqueeze(1) * dp2_y - c_e_v0v2_y.unsqueeze(1) * dp2_x
+                w_val = 1.0 - u_val - v_val
 
-            # w2 = cross2d(V1-V0, P-V0)
-            dp0_x = px - c_V0x.unsqueeze(1)
-            dp0_y = py - c_V0y.unsqueeze(1)
-            w2 = c_e_v1v0_x.unsqueeze(1) * dp0_y - c_e_v1v0_y.unsqueeze(1) * dp0_x
+                in_tri = (u_val >= 0) & (v_val >= 0) & (w_val >= 0)
 
-            # Winding test
-            in_tri = tile_hit & (
-                ((w0 >= 0) & (w1 >= 0) & (w2 >= 0)) |
-                ((w0 <= 0) & (w1 <= 0) & (w2 <= 0))
-            )  # (B, Rc, k)
+                if not in_tri.any():
+                    continue
 
-            # Barycentric coordinates
-            area_r = c_area.unsqueeze(1)                           # (B, 1, k)
-            u = torch.where(in_tri, w0 / area_r, torch.zeros_like(w0))
-            v = torch.where(in_tri, w1 / area_r, torch.zeros_like(w1))
-            w_bary = 1.0 - u - v
+                # ── DEPTH ─────────────────────────────────────────────────
+                Z_val = u_val * c0z + v_val * c1z + w_val * c2z
 
-            # ── Stage 4: VISIBILITY (Z-buffer + depth validity) ───────────
-            Z_hit = (u * c_Z0.unsqueeze(1) +
-                     v * c_Z1.unsqueeze(1) +
-                     w_bary * c_Z2.unsqueeze(1))                   # (B, Rc, k)
+                # [FIX 4] Reject negative depth + non-triangle hits
+                valid_depth = in_tri & (Z_val > 0)
+                Z_val = torch.where(valid_depth, Z_val, INF)
 
-            # [FIX 4] Reject negative depth (behind camera)
-            valid_hit = in_tri & (Z_hit > 0)                       # (B, Rc, k)
+                # ── WORLD-SPACE INTERPOLATION [FIX 1] ─────────────────────
+                V0_sel = V0_world[f_idx]                           # (N, 3)
+                V1_sel = V1_world[f_idx]
+                V2_sel = V2_world[f_idx]
 
-            Z_inf = torch.where(valid_hit, Z_hit,
-                                torch.full_like(Z_hit, float('inf')))
+                interp = (
+                    u_val.unsqueeze(-1) * V0_sel +
+                    v_val.unsqueeze(-1) * V1_sel +
+                    w_val.unsqueeze(-1) * V2_sel
+                )  # (N, 3)
 
-            # ── Stage 5: DISTANCE (world-space, component-wise) ───────────
-            # [FIX 1] Interpolate in WORLD SPACE, not NDC
-            # [FIX 5] Component-wise to avoid (B, Rc, k, 3) tensor
-            cV0wx = V0_world[cand_idx, 0]                         # (k,)
-            cV0wy = V0_world[cand_idx, 1]
-            cV0wz = V0_world[cand_idx, 2]
-            cV1wx = V1_world[cand_idx, 0]
-            cV1wy = V1_world[cand_idx, 1]
-            cV1wz = V1_world[cand_idx, 2]
-            cV2wx = V2_world[cand_idx, 0]
-            cV2wy = V2_world[cand_idx, 1]
-            cV2wz = V2_world[cand_idx, 2]
+                # Face centers for the camera batch (offset by b_start)
+                fc_sel = face_centers[b_start + b_idx]             # (N, 3)
+                d = torch.norm(interp - fc_sel, dim=-1)            # (N,)
 
-            # Perspective-correct weights
-            cW0_br = c_W0.unsqueeze(1)                             # (B, 1, k)
-            cW1_br = c_W1.unsqueeze(1)
-            cW2_br = c_W2.unsqueeze(1)
-            inv_W = u / cW0_br + v / cW1_br + w_bary / cW2_br     # (B, Rc, k)
-            W_interp = 1.0 / (inv_W + 1e-12)
+                # ── VISIBILITY: per-camera soft/hard Z-buffer ─────────────
+                unique_b = b_idx.unique()
+                for bi in unique_b:
+                    b_mask = (b_idx == bi)
+                    Z_b = Z_val[b_mask]
+                    d_b = d[b_mask]
+                    valid_b = valid_depth[b_mask]
 
-            # Component-wise world-space hit point: (B, Rc, k)
-            u_w0 = u / cW0_br                                     # (B, Rc, k)
-            v_w1 = v / cW1_br
-            w_w2 = w_bary / cW2_br
+                    if not valid_b.any():
+                        continue
 
-            # (B, Rc, k) * scalar(k) via broadcast — NO 4D tensor
-            hp_x = W_interp * (u_w0 * cV0wx + v_w1 * cV1wx + w_w2 * cV2wx)
-            hp_y = W_interp * (u_w0 * cV0wy + v_w1 * cV1wy + w_w2 * cV2wy)
-            hp_z = W_interp * (u_w0 * cV0wz + v_w1 * cV1wz + w_w2 * cV2wz)
+                    if alpha is not None and alpha > 0:
+                        # [FIX 3] Stable softmin with Z-shift
+                        Z_shift = Z_b - Z_b[valid_b].min()
+                        weights = torch.softmax(-alpha * Z_shift, dim=0)
+                        sdf_chunk[bi, r] = (weights * d_b).sum()
+                    else:
+                        # Hard min: pick closest face
+                        best = Z_b.argmin()
+                        sdf_chunk[bi, r] = d_b[best]
 
-            # Distance from face center (world space)
-            fc_x = face_centers[b_start:b_end, 0].view(B, 1, 1)   # (B, 1, 1)
-            fc_y = face_centers[b_start:b_end, 1].view(B, 1, 1)
-            fc_z = face_centers[b_start:b_end, 2].view(B, 1, 1)
-
-            dx = hp_x - fc_x                                      # (B, Rc, k)
-            dy = hp_y - fc_y
-            dz = hp_z - fc_z
-            dists_all = torch.sqrt(dx*dx + dy*dy + dz*dz + 1e-12) # (B, Rc, k)
-
-            # ── Z-buffer: soft or hard ────────────────────────────────────
-            if alpha is not None and alpha > 0:
-                # [FIX 3] Stable softmin: shift Z before scaling
-                Z_for_soft = torch.where(valid_hit, Z_hit,
-                    torch.tensor(1e6, device=device, dtype=Z_hit.dtype))
-                Z_min = Z_for_soft.min(dim=-1, keepdim=True).values
-                Z_shifted = Z_for_soft - Z_min                     # (B, Rc, k)
-                weights = torch.softmax(-alpha * Z_shifted, dim=-1)
-                dists_chunk = (weights * dists_all).sum(dim=-1)    # (B, Rc)
-                valid_ray = valid_hit.any(dim=-1)                  # (B, Rc)
-            else:
-                # Hard min (original v3 logic)
-                best_z, best_k = torch.min(Z_inf, dim=2)          # (B, Rc)
-                valid_ray = best_z < float('inf')
-                dists_chunk = dists_all.gather(
-                    2, best_k.unsqueeze(2)).squeeze(2)             # (B, Rc)
+                    valid_chunk[bi, r] = 1.0
 
             # ── Accumulate across ray chunks ──────────────────────────────
-            valid_f   = valid_ray.float()
-            dist_sum += (dists_chunk * valid_f).sum(dim=1)
-            hit_cnt  += valid_f.sum(dim=1)
+            dist_sum += sdf_chunk.sum(dim=-1)                      # (B,)
+            hit_cnt  += valid_chunk.sum(dim=-1)                    # (B,)
 
         # ── Final SDF = mean distance over valid rays ─────────────────────
         sdf_values[b_start:b_end] = dist_sum / (hit_cnt + 1e-8)
